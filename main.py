@@ -183,7 +183,7 @@ def run_device(agent_config: AgentConfig, device: DeviceConfig) -> None:
 
 def main() -> None:
     configure_logging()
-
+    print("--- Version 2.0.0 ---")
     base_dir = Path(__file__).resolve().parent
     candidate_paths = [
         base_dir / "config.json",

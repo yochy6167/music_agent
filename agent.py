@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -391,51 +392,61 @@ class Agent:
     async def _handle_update_software(self, command: dict) -> None:
         logger.info("Starting remote update via Git...")
         await self._send_update_notice("Starting remote update via Git...")
+        await self._send_ws_log("Pulling latest code...")
 
         git_process = await asyncio.create_subprocess_shell(
             "git pull",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await git_process.communicate()
+
+        stdout_lines: List[str] = []
+        stderr_lines: List[str] = []
+
+        async def read_stream(stream: Optional[asyncio.StreamReader], collector: List[str], is_error: bool) -> None:
+            if not stream:
+                return
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode(errors="replace").rstrip()
+                if not text:
+                    continue
+                collector.append(text)
+                if is_error:
+                    logger.error(text)
+                else:
+                    logger.info(text)
+
+        await asyncio.gather(
+            read_stream(git_process.stdout, stdout_lines, False),
+            read_stream(git_process.stderr, stderr_lines, True),
+        )
+        await git_process.wait()
+
         if git_process.returncode != 0:
-            logger.error(
-                "Git pull failed (%s): %s",
-                git_process.returncode,
-                (stderr or stdout or b"").decode(errors="replace").strip(),
-            )
+            error_output = "\n".join(stderr_lines or stdout_lines).strip()
+            logger.error("Git pull failed (%s): %s", git_process.returncode, error_output)
             await self._send_update_notice("Remote update failed during git pull.")
+            await self._send_ws_log("Git pull failed. Update aborted.")
             return
 
-        logger.info("Git pull succeeded, restarting service...")
-        await self._send_update_notice("Git pull succeeded. Restarting service.")
-
-        restart_process = await asyncio.create_subprocess_shell(
-            "sudo systemctl restart music_agent.service",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            restart_stdout, restart_stderr = await asyncio.wait_for(
-                restart_process.communicate(),
-                timeout=8,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("systemctl restart still running; exiting for systemd.")
-            os._exit(0)
-
-        if restart_process.returncode != 0:
-            logger.warning(
-                "systemctl restart failed (%s): %s",
-                restart_process.returncode,
-                (restart_stderr or restart_stdout or b"").decode(errors="replace").strip(),
-            )
+        service_mode = bool(os.environ.get("INVOCATION_ID"))
+        if not service_mode:
+            logger.info("Update complete (Manual mode). Please restart the agent to apply changes.")
             await self._send_update_notice(
-                "systemctl restart failed. Exiting for systemd Restart=always.",
+                "Update complete (Manual mode). Please restart the agent to apply changes.",
             )
-            os._exit(0)
+            return
 
-        os._exit(0)
+        await self._send_update_notice("Restarting...")
+        await asyncio.sleep(2)
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as exc:
+            logger.warning("Exec restart failed: %s", exc)
+            os._exit(0)
 
     async def _send_update_notice(self, message: str) -> None:
         try:
@@ -453,6 +464,15 @@ class Agent:
                     "type": "agent_log",
                     "message": message,
                     "level": "info",
+                }
+            )
+
+    async def _send_ws_log(self, message: str) -> None:
+        if self.ws_client and self.ws_client.connected:
+            await self.ws_client.send(
+                {
+                    "type": "log",
+                    "message": message,
                 }
             )
     async def _heartbeat_loop(self) -> None:
