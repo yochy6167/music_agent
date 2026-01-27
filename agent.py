@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -347,6 +348,9 @@ class Agent:
         command_type = command.get("type")
         action = command.get("action")
         try:
+            if action == "UPDATE_SOFTWARE":
+                await self._handle_update_software(command)
+                return
             if command_type == "playback_control":
                 await self._handle_playback_control(command)
             elif command_type == "volume_control":
@@ -384,6 +388,73 @@ class Agent:
         if volume is not None:
             await self.player.set_volume(volume)
 
+    async def _handle_update_software(self, command: dict) -> None:
+        logger.info("Starting remote update via Git...")
+        await self._send_update_notice("Starting remote update via Git...")
+
+        git_process = await asyncio.create_subprocess_shell(
+            "git pull",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await git_process.communicate()
+        if git_process.returncode != 0:
+            logger.error(
+                "Git pull failed (%s): %s",
+                git_process.returncode,
+                (stderr or stdout or b"").decode(errors="replace").strip(),
+            )
+            await self._send_update_notice("Remote update failed during git pull.")
+            return
+
+        logger.info("Git pull succeeded, restarting service...")
+        await self._send_update_notice("Git pull succeeded. Restarting service.")
+
+        restart_process = await asyncio.create_subprocess_shell(
+            "sudo systemctl restart music_agent.service",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            restart_stdout, restart_stderr = await asyncio.wait_for(
+                restart_process.communicate(),
+                timeout=8,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("systemctl restart still running; exiting for systemd.")
+            os._exit(0)
+
+        if restart_process.returncode != 0:
+            logger.warning(
+                "systemctl restart failed (%s): %s",
+                restart_process.returncode,
+                (restart_stderr or restart_stdout or b"").decode(errors="replace").strip(),
+            )
+            await self._send_update_notice(
+                "systemctl restart failed. Exiting for systemd Restart=always.",
+            )
+            os._exit(0)
+
+        os._exit(0)
+
+    async def _send_update_notice(self, message: str) -> None:
+        try:
+            status = await self.player.get_status()
+            heartbeat = self._build_heartbeat(status)
+            heartbeat["status_message"] = message
+            heartbeat["update_in_progress"] = True
+            await self.client.send_heartbeat(heartbeat)
+        except Exception as exc:
+            logger.warning("Update notice heartbeat failed: %s", exc)
+
+        if self.ws_client and self.ws_client.connected:
+            await self.ws_client.send(
+                {
+                    "type": "agent_log",
+                    "message": message,
+                    "level": "info",
+                }
+            )
     async def _heartbeat_loop(self) -> None:
         while self.running:
             try:
