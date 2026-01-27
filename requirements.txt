@@ -1,0 +1,4 @@
+httpx
+websockets
+python-vlc
+yt-dlp
