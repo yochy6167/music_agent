@@ -42,9 +42,6 @@ def load_or_init_config(config_path: Path) -> AgentConfig:
         raise FileNotFoundError(f"config.json not found at {config_path}")
 
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    if not data.get("devices"):
-        raise ValueError("config.json must include a non-empty devices list")
-
     for device in data.get("devices", []):
         if not device.get("device_name"):
             device["device_name"] = platform.node()
@@ -110,6 +107,44 @@ def persist_device_token(
         json.dump(data, handle, ensure_ascii=False, indent=2)
 
 
+def persist_device_entry(
+    config_path: Path,
+    device: DeviceConfig,
+    api_url: str,
+    ws_url: str,
+) -> None:
+    if config_path.exists():
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        devices_data = data.get("devices", [])
+    else:
+        data = {"api_url": api_url, "ws_url": ws_url, "devices": []}
+        devices_data = data["devices"]
+
+    for entry in devices_data:
+        entry_id = str(entry.get("device_id", "")).strip()
+        entry_name = str(entry.get("device_name", "")).strip()
+        entry_branch = int(entry.get("branch_id", 0))
+        if device.device_id and entry_id == device.device_id:
+            entry["device_name"] = device.device_name
+            entry["branch_id"] = device.branch_id
+            break
+        if not device.device_id and entry_name == device.device_name and entry_branch == device.branch_id:
+            entry["device_name"] = device.device_name
+            break
+    else:
+        devices_data.append(
+            {
+                "device_id": device.device_id,
+                "device_name": device.device_name,
+                "branch_id": device.branch_id,
+                "device_token": device.device_token,
+            }
+        )
+
+    with config_path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+
+
 async def register_device_with_retry(
     api_url: str,
     device: DeviceConfig,
@@ -166,6 +201,23 @@ def main() -> None:
     hardware_id = get_rpi_serial()
     if not hardware_id:
         logging.warning("RPi serial not found; using fallback hardware id")
+
+    if not config.devices:
+        device_name = platform.node()
+        default_device = DeviceConfig(
+            device_id=hardware_id,
+            device_name=device_name,
+            branch_id=0,
+            device_token="",
+        )
+        persist_device_entry(
+            config_path=config_path,
+            device=default_device,
+            api_url=config.api_url,
+            ws_url=config.ws_url,
+        )
+        config = AgentConfig(api_url=config.api_url, ws_url=config.ws_url, devices=[default_device])
+        logging.info("Initialized config with device_name=%s", device_name)
 
     updated_devices: List[DeviceConfig] = []
     for device in config.devices:
