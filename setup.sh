@@ -114,7 +114,7 @@ WorkingDirectory=${SCRIPT_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=SYSTEM_SINK_VOLUME=100
 Environment=AUDIO_PREFER=auto
-Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=XDG_RUNTIME_DIR=/run/user/%u
 ExecStartPre=${VOLUME_SCRIPT}
 ExecStart=${PYTHON_BIN} ${SCRIPT_DIR}/main.py
 Restart=on-failure

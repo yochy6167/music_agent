@@ -97,7 +97,7 @@ chmod +x scripts/deploy-from-pc.sh
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
-git clone <כתובת-ה-repo-שלך> ~/music_agent
+git clone yochy6167/music_agent
 cd ~/music_agent
 cp config.json.example config.json
 # ערוך config.json אם כתובות השרת שונות
