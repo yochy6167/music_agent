@@ -9,6 +9,22 @@ DNS_SERVERS="${DNS_SERVERS:-1.1.1.1 8.8.8.8}"
 SET_DNS="${SET_DNS:-0}"
 SKIP_DNS="${SKIP_DNS:-0}"
 
+maybe_enable_hdmi_hotplug() {
+  local cfg
+  for cfg in /boot/firmware/config.txt /boot/config.txt; do
+    if [[ -f "${cfg}" ]]; then
+      if grep -qE '^hdmi_force_hotplug=1' "${cfg}"; then
+        echo "hdmi_force_hotplug already set in ${cfg}"
+      else
+        echo "hdmi_force_hotplug=1" | sudo tee -a "${cfg}" >/dev/null
+        echo "Added hdmi_force_hotplug=1 to ${cfg} (HDMI audio when amp connected, no monitor)"
+      fi
+      return 0
+    fi
+  done
+  echo "boot config.txt not found; skipping hdmi_force_hotplug."
+}
+
 maybe_configure_dns() {
   if [[ "${SKIP_DNS}" == "1" ]]; then
     echo "Skipping DNS configuration (SKIP_DNS=1)."
@@ -46,6 +62,7 @@ if [[ ! -f config.json ]]; then
 fi
 
 maybe_configure_dns
+maybe_enable_hdmi_hotplug
 
 echo "Updating apt packages..."
 sudo apt-get update -qq
@@ -69,10 +86,18 @@ echo "Installing Python dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
+chmod +x "${SCRIPT_DIR}/scripts/set-system-volume.sh" 2>/dev/null || true
+
 echo "Configuring systemd service..."
 SERVICE_NAME="music_agent"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python3"
+VOLUME_SCRIPT="${SCRIPT_DIR}/scripts/set-system-volume.sh"
+
+# Headless Pi: run PipeWire/Pulse for user ${USER} at boot (needed for pactl + VLC).
+if command -v loginctl >/dev/null 2>&1; then
+  sudo loginctl enable-linger "${USER}" 2>/dev/null || true
+fi
 
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
@@ -87,6 +112,10 @@ Type=simple
 User=${USER}
 WorkingDirectory=${SCRIPT_DIR}
 Environment=PYTHONUNBUFFERED=1
+Environment=SYSTEM_SINK_VOLUME=100
+Environment=AUDIO_PREFER=auto
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+ExecStartPre=${VOLUME_SCRIPT}
 ExecStart=${PYTHON_BIN} ${SCRIPT_DIR}/main.py
 Restart=on-failure
 RestartSec=10
@@ -98,6 +127,9 @@ EOF
 
 echo "Adding user to audio and video groups..."
 sudo usermod -aG audio,video "${USER}"
+
+echo "Setting default system sink volume (PulseAudio/PipeWire)..."
+"${VOLUME_SCRIPT}" || true
 
 echo "Enabling and starting service..."
 sudo systemctl daemon-reload
@@ -111,4 +143,6 @@ curl -fsS "$(python3 -c "import json; print(json.load(open('config.json'))['api_
 
 echo "Setup complete."
 echo "Service '${SERVICE_NAME}' is running and enabled on boot."
+echo "Audio: auto-pick HDMI if connected, else headphones; volume 100% on each agent start."
+echo "Optional: AUDIO_PREFER=hdmi|headphones in the systemd unit to force one output."
 echo "If audio/video groups were updated, log out and back in to apply."

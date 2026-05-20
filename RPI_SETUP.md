@@ -133,14 +133,38 @@ journalctl -u music_agent -f
 
 ### אודיו (חיבור רמקולים)
 
+ב-Raspberry Pi OS חדש השמע מנוהל דרך **PulseAudio/PipeWire** (לא `raspi-config`).
+
+`setup.sh` מגדיר אוטומטית:
+
+- עוצמת מערכת **100%** לפני כל הפעלה של הסוכן (`scripts/set-system-volume.sh`)
+- `loginctl enable-linger` כדי ש-PipeWire יעלה גם ב-headless
+
 ```bash
-# בדיקת יציאות
-aplay -l
-# בחירת יציאה (דוגמה — HDMI)
-sudo raspi-config nonint do_audio 2
+# בדיקת עוצמת מערכת
+pactl get-sink-volume @DEFAULT_SINK@
+
+# בדיקת עוצמת ALSA (לעיתים PCM נפרד)
+amixer -c 0 sget 'PCM'
 ```
 
-המשתמש `pi` נוסף לקבוצות `audio` ו-`video` ב-`setup.sh`. אם אין צליל אחרי התקנה — התנתק והתחבר מחדש פעם אחת, או הפעל מחדש: `sudo reboot`.
+**שתי שכבות עוצמה:** מערכת (`pactl`) + נגן VLC (מהדשבורד, ברירת מחדל 50%). אם 50% בדשבורד נשמע חלש — העלה בדשבורד ל-80–100%.
+
+### HDMI למגבר בסניף (בלי פקודות ידניות)
+
+`setup.sh` מכין אוטומטית:
+
+1. **`hdmi_force_hotplug=1`** ב-`/boot/firmware/config.txt` — HDMI פעיל גם בלי מסך (מגבר דלוק לפני ה-Pi).
+2. **`AUDIO_PREFER=auto`** — לפני כל הפעלה של הסוכן:
+   - אם יש sink של **HDMI** → בוחר אותו + 100% עוצמה
+   - אחרת → **שקע אוזניות** (בית / בדיקות)
+
+**בסניף:** חבר HDMI למגבר, הדלק מגבר ואז Pi (או reboot). אין צורך ב-`pactl` ידני.
+
+אם תמיד HDMI בלבד (בלי אוזניות): אחרי `setup.sh` אפשר לערוך:
+`sudo systemctl edit music_agent` → `Environment=AUDIO_PREFER=hdmi`
+
+המשתמש `pi` נוסף לקבוצות `audio` ו-`video` ב-`setup.sh`.
 
 ### כתובות שרת
 
