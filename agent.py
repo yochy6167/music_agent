@@ -306,6 +306,7 @@ class Agent:
         while self.running:
             await asyncio.sleep(30)
             if self.ws_client and self.ws_client.connected:
+                # Get full status including playback_position/playback_length
                 status = await self.player.get_status()
                 await self.ws_client.send(
                     {
@@ -314,6 +315,10 @@ class Agent:
                         "is_playing": status.get("is_playing", False),
                         "current_track_id": status.get("current_track_id"),
                         "current_playlist_id": status.get("current_playlist_id"),
+                        "current_track": status.get("current_track"),
+                        "track_position": status.get("track_position"),
+                        "playback_position": status.get("playback_position"),
+                        "playback_length": status.get("playback_length"),
                     }
                 )
             else:

@@ -16,6 +16,7 @@ venv/
 env/
 .env
 .env.*
+config.json
 *.log
 *.sqlite3
 *.db
@@ -32,3 +33,4 @@ htmlcov/
 *.bak
 *.zip
 *.tar.gz
+music_agent.rar
