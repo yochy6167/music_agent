@@ -2,7 +2,7 @@ import asyncio
 import logging
 import platform
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
 import httpx
 
@@ -28,6 +28,9 @@ class MusicPlayer:
         self.repeat_mode: str = "repeat_all"
         self.current_track: Optional[Dict[str, Any]] = None
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self.on_track_ended: Optional[
+            Callable[[int, Optional[int], float], Union[Awaitable[None], None]]
+        ] = None
 
         self._init_vlc()
 
@@ -216,6 +219,27 @@ class MusicPlayer:
             asyncio.run_coroutine_threadsafe(self._handle_track_end(), self._event_loop)
 
     async def _handle_track_end(self) -> None:
+        ended_track_id = self.current_track_id
+        ended_playlist_id = self.current_playlist_id
+        duration_played = 0.0
+        if self.player:
+            try:
+                duration_played = max(self.player.get_time() / 1000.0, 0.0)
+            except Exception:
+                duration_played = 0.0
+
+        if self.on_track_ended and ended_track_id is not None:
+            try:
+                result = self.on_track_ended(
+                    int(ended_track_id),
+                    int(ended_playlist_id) if ended_playlist_id is not None else None,
+                    duration_played,
+                )
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.warning("on_track_ended callback failed: %s", exc)
+
         if self.repeat_mode == "repeat_one":
             await self._play_current_track()
             return

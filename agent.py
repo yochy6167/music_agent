@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 import httpx
@@ -119,6 +120,18 @@ class ServerClient:
         except httpx.HTTPError as exc:
             logger.error("Playlist fetch error: %s", exc)
             return None
+
+    async def log_playback_event(self, event: Dict[str, Any]) -> bool:
+        """Log playback analytics to server (playback_logs table)."""
+        url = f"{self.api_url}/api/v1/playback/log"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(url, json=event, headers=self.headers)
+                response.raise_for_status()
+                return True
+        except httpx.HTTPError as exc:
+            logger.warning("Playback log error: %s", exc)
+            return False
 
 
 class WebSocketClient:
@@ -239,6 +252,7 @@ class Agent:
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
         self.player.set_event_loop(loop)
+        self.player.on_track_ended = self._log_track_playback
 
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
@@ -353,8 +367,10 @@ class Agent:
     async def _handle_command(self, command: dict) -> None:
         command_type = command.get("type")
         action = command.get("action")
+        action_normalized = (action or "").upper().replace("-", "_")
         try:
-            if action == "UPDATE_SOFTWARE":
+            # Dashboard sends action=update_software (admin API)
+            if action_normalized == "UPDATE_SOFTWARE":
                 await self._handle_update_software(command)
                 return
             if command_type == "playback_control":
@@ -379,6 +395,14 @@ class Agent:
         elif action == "pause":
             await self.player.pause()
         elif action == "stop":
+            status = await self.player.get_status()
+            track_id = status.get("current_track_id")
+            if track_id:
+                await self._log_track_playback(
+                    track_id=int(track_id),
+                    playlist_id=status.get("current_playlist_id"),
+                    duration_played=float(status.get("playback_position") or 0.0),
+                )
             await self.player.stop()
         elif action in {"skip", "next"}:
             await self.player.next()
@@ -480,6 +504,26 @@ class Agent:
                     "message": message,
                 }
             )
+
+    async def _log_track_playback(
+        self,
+        track_id: int,
+        playlist_id: Optional[int],
+        duration_played: float,
+    ) -> None:
+        """Persist completed track playback for dashboard analytics."""
+        if duration_played < 1.0:
+            return
+        await self.client.log_playback_event(
+            {
+                "event_type": "track_ended",
+                "track_id": track_id,
+                "playlist_id": playlist_id,
+                "duration_played": round(duration_played, 2),
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
     async def _heartbeat_loop(self) -> None:
         while self.running:
             try:
