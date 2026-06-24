@@ -248,13 +248,18 @@ class Agent:
         self.running = True
         self.is_connected = False
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._last_ws_payload: Optional[dict] = None
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
         self.player.set_event_loop(loop)
         self.player.on_track_ended = self._log_track_playback
 
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # In the current backend_unified WS implementation, agent status_update
+        # messages are persisted to the DB server-side. Avoid duplicate HTTP
+        # heartbeats when WS is enabled (reduces load and improves resiliency).
+        if not self.config.ws_url:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
             if self.config.ws_url:
                 await self._start_websocket_with_retries()
@@ -296,7 +301,10 @@ class Agent:
                 commands = data.get("commands", [])
                 if commands:
                     await self._handle_commands(commands)
-            elif message_type in {"playback_control", "volume_control"}:
+            elif message_type in {"playback_control", "volume_control", "agent_control"}:
+                # agent_control: dashboard "Update Software" (action=update_software)
+                await self._handle_command(data)
+            elif data.get("action"):
                 await self._handle_command(data)
 
         def on_connect() -> None:
@@ -317,26 +325,59 @@ class Agent:
             ws_task.cancel()
             raise RuntimeError("WS connection failed to establish")
 
+        # Adaptive WS cadence:
+        # - While playing, send anchors frequently so the dashboard timeline stays accurate.
+        # - While idle, send infrequent keepalive updates.
+        playing_interval_s = 5
+        idle_interval_s = 30
+
         while self.running:
-            await asyncio.sleep(30)
-            if self.ws_client and self.ws_client.connected:
-                # Get full status including playback_position/playback_length
-                status = await self.player.get_status()
-                await self.ws_client.send(
-                    {
-                        "type": "status_update",
-                        "current_volume": status.get("volume", 50.0),
-                        "is_playing": status.get("is_playing", False),
-                        "current_track_id": status.get("current_track_id"),
-                        "current_playlist_id": status.get("current_playlist_id"),
-                        "current_track": status.get("current_track"),
-                        "track_position": status.get("track_position"),
-                        "playback_position": status.get("playback_position"),
-                        "playback_length": status.get("playback_length"),
-                    }
-                )
-            else:
+            if not (self.ws_client and self.ws_client.connected):
                 break
+
+            status = await self.player.get_status()
+            pos = status.get("playback_position")
+            length = status.get("playback_length")
+            is_playing = bool(status.get("is_playing", False))
+
+            payload = {
+                "type": "status_update",
+                "status": "healthy" if self.player.is_healthy() else "error",
+                "current_volume": status.get("volume", 50.0),
+                "is_playing": is_playing,
+                "current_track_id": status.get("current_track_id"),
+                "current_playlist_id": status.get("current_playlist_id"),
+                "current_track": status.get("current_track"),
+                "track_position": status.get("track_position"),
+                "playback_position": float(pos) if pos is not None else 0.0,
+                "playback_length": float(length) if length is not None else 0.0,
+                "playback_speed": 1.0,
+            }
+
+            send_now = False
+            if self._last_ws_payload is None:
+                send_now = True
+            else:
+                keys = [
+                    "status",
+                    "current_volume",
+                    "is_playing",
+                    "current_track_id",
+                    "current_playlist_id",
+                ]
+                if any(self._last_ws_payload.get(k) != payload.get(k) for k in keys):
+                    send_now = True
+
+            if is_playing:
+                send_now = True
+
+            if send_now:
+                ok = await self.ws_client.send(payload)
+                if not ok:
+                    break
+                self._last_ws_payload = payload
+
+            await asyncio.sleep(playing_interval_s if is_playing else idle_interval_s)
 
         if self.ws_client:
             await self.ws_client.disconnect()
