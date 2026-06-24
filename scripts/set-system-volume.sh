@@ -3,7 +3,7 @@
 # AUDIO_PREFER: auto (default) | hdmi | headphones
 set -euo pipefail
 
-VOLUME="${SYSTEM_SINK_VOLUME:-100}"
+VOLUME="${SYSTEM_SINK_VOLUME:-90}"
 PREFER="${AUDIO_PREFER:-auto}"
 
 if ! command -v pactl >/dev/null 2>&1; then
