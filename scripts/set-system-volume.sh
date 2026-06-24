@@ -15,6 +15,14 @@ if [[ -z "${XDG_RUNTIME_DIR:-}" ]] && [[ -d "/run/user/$(id -u)" ]]; then
   export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 fi
 
+# WSLg (Windows 11): route audio to Windows speakers via PulseAudio socket.
+if [[ -S /mnt/wslg/PulseServer ]]; then
+  export PULSE_SERVER="${PULSE_SERVER:-unix:/mnt/wslg/PulseServer}"
+  if [[ -f /mnt/wslg/PulseCookie ]]; then
+    export PULSE_COOKIE="${PULSE_COOKIE:-/mnt/wslg/PulseCookie}"
+  fi
+fi
+
 pick_sink() {
   local sinks="$1"
   local pattern="$2"

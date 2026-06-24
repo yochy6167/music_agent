@@ -99,6 +99,12 @@ if command -v loginctl >/dev/null 2>&1; then
   sudo loginctl enable-linger "${USER}" 2>/dev/null || true
 fi
 
+WSL_AUDIO_ENV=""
+if [[ -S /mnt/wslg/PulseServer ]]; then
+  WSL_AUDIO_ENV=$'Environment=PULSE_SERVER=unix:/mnt/wslg/PulseServer\nEnvironment=PULSE_COOKIE=/mnt/wslg/PulseCookie'
+  echo "WSLg detected: audio will use Windows speakers via PulseAudio."
+fi
+
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
 Description=Neeman Music Agent
@@ -115,7 +121,8 @@ Environment=PYTHONUNBUFFERED=1
 Environment=SYSTEM_SINK_VOLUME=90
 Environment=AUDIO_PREFER=auto
 Environment=XDG_RUNTIME_DIR=/run/user/%u
-ExecStartPre=${VOLUME_SCRIPT}
+${WSL_AUDIO_ENV}
+ExecStartPre=/bin/bash ${VOLUME_SCRIPT}
 ExecStart=${PYTHON_BIN} ${SCRIPT_DIR}/main.py
 Restart=on-failure
 RestartSec=10
