@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -133,6 +134,17 @@ class ServerClient:
             logger.warning("Playback log error: %s", exc)
             return False
 
+    async def get_ad_transition_config(self) -> Optional[list]:
+        url = f"{self.api_url}/api/v1/devices/ads/transition-config"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url, headers=self.headers)
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPError as exc:
+            logger.warning("Failed to load ad transition config: %s", exc)
+            return None
+
 
 class WebSocketClient:
     def __init__(self, ws_url: str, device_token: str, branch_id: int) -> None:
@@ -249,11 +261,18 @@ class Agent:
         self.is_connected = False
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._last_ws_payload: Optional[dict] = None
+        self._transition_campaigns: list = []
+        self._transition_pick_index = 0
+        self._ad_config_refresh_counter = 0
+        self._ws_status_ticks = 0
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
         self.player.set_event_loop(loop)
         self.player.on_track_ended = self._log_track_playback
+        self.player.on_ad_transition_check = self._on_ad_transition_check
+        self.player.on_ad_finished = self._on_ad_finished
+        await self._refresh_transition_campaigns()
 
         # In the current backend_unified WS implementation, agent status_update
         # messages are persisted to the DB server-side. Avoid duplicate HTTP
@@ -301,8 +320,7 @@ class Agent:
                 commands = data.get("commands", [])
                 if commands:
                     await self._handle_commands(commands)
-            elif message_type in {"playback_control", "volume_control", "agent_control"}:
-                # agent_control: dashboard "Update Software" (action=update_software)
+            elif message_type in {"playback_control", "volume_control", "agent_control", "ad_control"}:
                 await self._handle_command(data)
             elif data.get("action"):
                 await self._handle_command(data)
@@ -377,6 +395,10 @@ class Agent:
                     break
                 self._last_ws_payload = payload
 
+            self._ws_status_ticks += 1
+            if self._ws_status_ticks % 20 == 0:
+                await self._refresh_transition_campaigns()
+
             await asyncio.sleep(playing_interval_s if is_playing else idle_interval_s)
 
         if self.ws_client:
@@ -401,6 +423,10 @@ class Agent:
             if commands:
                 await self._handle_commands(commands)
 
+            self._ad_config_refresh_counter += 1
+            if self._ad_config_refresh_counter % 20 == 0:
+                await self._refresh_transition_campaigns()
+
     async def _handle_commands(self, commands: list) -> None:
         for command in commands:
             await self._handle_command(command)
@@ -418,6 +444,8 @@ class Agent:
                 await self._handle_playback_control(command)
             elif command_type == "volume_control":
                 await self._handle_volume_control(command)
+            elif command_type == "ad_control":
+                await self._handle_ad_control(command)
             else:
                 logger.warning("Unknown command type: %s", command_type)
         except Exception as exc:
@@ -458,6 +486,76 @@ class Agent:
         volume = command.get("volume")
         if volume is not None:
             await self.player.set_volume(volume)
+
+    async def _handle_ad_control(self, command: dict) -> None:
+        if command.get("action") != "play":
+            return
+        campaign_id = command.get("campaign_id")
+        if campaign_id is None:
+            logger.warning("ad_control missing campaign_id")
+            return
+        await self.player.play_ad(
+            audio_url=command.get("audio_url") or "",
+            campaign_id=int(campaign_id),
+            audio_media_id=command.get("audio_media_id"),
+        )
+
+    async def _on_ad_finished(
+        self,
+        *,
+        campaign_id: int,
+        completed: bool,
+        duration_played: float,
+        error: Optional[str] = None,
+    ) -> None:
+        payload = {
+            "type": "ad_finished",
+            "campaign_id": campaign_id,
+            "branch_id": self.device.branch_id,
+            "completed": completed,
+            "duration_played": duration_played,
+            "error": error,
+        }
+        if self.ws_client and self.ws_client.connected:
+            await self.ws_client.send(payload)
+
+    async def _refresh_transition_campaigns(self) -> None:
+        data = await self.client.get_ad_transition_config()
+        if isinstance(data, list):
+            self._transition_campaigns = sorted(
+                data,
+                key=lambda c: (-int(c.get("priority", 0)), int(c.get("id", 0))),
+            )
+            logger.info("Loaded %s transition ad campaign(s)", len(self._transition_campaigns))
+
+    def _pick_transition_campaign(self) -> Optional[dict]:
+        if not self._transition_campaigns:
+            return None
+        top_priority = self._transition_campaigns[0].get("priority", 0)
+        tier = [c for c in self._transition_campaigns if c.get("priority", 0) == top_priority]
+        if len(tier) == 1:
+            return tier[0]
+        strategy = tier[0].get("rotation_strategy", "sequential")
+        if strategy == "random":
+            return random.choice(tier)
+        pick = tier[self._transition_pick_index % len(tier)]
+        self._transition_pick_index += 1
+        return pick
+
+    async def _on_ad_transition_check(self) -> bool:
+        self.player._tracks_since_ad += 1
+        campaign = self._pick_transition_campaign()
+        if not campaign:
+            return False
+        every_n = max(1, int(campaign.get("every_n_tracks") or 1))
+        if self.player._tracks_since_ad < every_n:
+            return False
+        self.player._tracks_since_ad = 0
+        return await self.player.play_ad(
+            audio_url=campaign.get("audio_url") or "",
+            campaign_id=int(campaign["id"]),
+            audio_media_id=campaign.get("audio_media_id"),
+        )
 
     async def _handle_update_software(self, command: dict) -> None:
         logger.info("Starting remote update via Git...")
@@ -571,6 +669,9 @@ class Agent:
                 await asyncio.sleep(30)
                 status = await self.player.get_status()
                 await self.client.send_heartbeat(self._build_heartbeat(status))
+                self._ad_config_refresh_counter += 1
+                if self._ad_config_refresh_counter % 20 == 0:
+                    await self._refresh_transition_campaigns()
             except asyncio.CancelledError:
                 break
             except Exception as exc:

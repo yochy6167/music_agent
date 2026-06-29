@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import platform
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
@@ -15,9 +16,13 @@ except Exception:  # pragma: no cover - runtime dependency
 
 
 class MusicPlayer:
+    CACHE_EXT = ".mp3"
+
     def __init__(self, api_url: str, device_token: str) -> None:
         self.api_url = api_url.rstrip("/")
         self.device_token = device_token
+        self.cache_dir = Path.home() / ".soundops_agent" / "audio_cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.instance = None
         self.player = None
         self.current_playlist_id: Optional[int] = None
@@ -31,6 +36,16 @@ class MusicPlayer:
         self.on_track_ended: Optional[
             Callable[[int, Optional[int], float], Union[Awaitable[None], None]]
         ] = None
+        self.on_ad_transition_check: Optional[Callable[[], Union[Awaitable[bool], bool]]] = None
+        self.on_ad_finished: Optional[
+            Callable[..., Union[Awaitable[None], None]]
+        ] = None
+
+        self._ad_playing = False
+        self._ad_campaign_id: Optional[int] = None
+        self._ad_started_at: float = 0.0
+        self._music_was_playing_before_ad = False
+        self._tracks_since_ad = 0
 
         self._init_vlc()
 
@@ -219,6 +234,19 @@ class MusicPlayer:
             asyncio.run_coroutine_threadsafe(self._handle_track_end(), self._event_loop)
 
     async def _handle_track_end(self) -> None:
+        if self._ad_playing:
+            await self._finish_ad_playback(completed=True)
+            return
+
+        if self.on_ad_transition_check:
+            try:
+                result = self.on_ad_transition_check()
+                handled = await result if asyncio.iscoroutine(result) else result
+                if handled:
+                    return
+            except Exception as exc:
+                logger.warning("on_ad_transition_check failed: %s", exc)
+
         ended_track_id = self.current_track_id
         ended_playlist_id = self.current_playlist_id
         duration_played = 0.0
@@ -254,6 +282,126 @@ class MusicPlayer:
 
         await self.next()
 
+    def _absolutize_url(self, url: str) -> str:
+        if not url:
+            return url
+        if url.startswith(("http://", "https://")):
+            return url
+        if url.startswith("/"):
+            return f"{self.api_url}{url}"
+        return f"{self.api_url}/{url.lstrip('/')}"
+
+    async def _download_to_cache(self, cache_key: int, url: str, dst: Path) -> bool:
+        try:
+            headers = {"X-Device-Token": self.device_token}
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                async with client.stream("GET", url, headers=headers) as response:
+                    response.raise_for_status()
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    with dst.open("wb") as handle:
+                        async for chunk in response.aiter_bytes():
+                            handle.write(chunk)
+            return dst.is_file() and dst.stat().st_size > 0
+        except Exception as exc:
+            logger.error("Ad cache download failed for %s: %s", cache_key, exc)
+            return False
+
+    async def _resolve_ad_play_url(self, url: str, cache_key: int) -> Optional[str]:
+        abs_url = self._absolutize_url(url)
+        cache_path = self.cache_dir / f"ad_{cache_key}{self.CACHE_EXT}"
+        if cache_path.is_file() and cache_path.stat().st_size > 0:
+            return str(cache_path)
+        if await self._download_to_cache(cache_key, abs_url, cache_path):
+            return str(cache_path)
+        return abs_url
+
+    async def play_ad(
+        self,
+        audio_url: str,
+        campaign_id: int,
+        audio_media_id: Optional[int] = None,
+    ) -> bool:
+        if not self.player or not self.instance:
+            logger.error("Cannot play ad — VLC not initialized")
+            return False
+        if self._ad_playing:
+            logger.warning("Ad already playing — ignoring duplicate ad_control")
+            return False
+
+        status = await self.get_status()
+        self._music_was_playing_before_ad = bool(status.get("is_playing"))
+        if self._music_was_playing_before_ad:
+            try:
+                self.player.pause()
+            except Exception:
+                pass
+
+        cache_key = audio_media_id if audio_media_id is not None else campaign_id
+        play_url = await self._resolve_ad_play_url(audio_url, cache_key)
+        if not play_url:
+            await self._finish_ad_playback(completed=False, error="missing_audio_url")
+            return False
+
+        self._ad_playing = True
+        self._ad_campaign_id = campaign_id
+        self._ad_started_at = time.time()
+
+        try:
+            media = self.instance.media_new(play_url)
+            if not media:
+                await self._finish_ad_playback(completed=False, error="vlc_media_failed")
+                return False
+            self.player.set_media(media)
+            result = self.player.play()
+            if result != 0:
+                await self._finish_ad_playback(completed=False, error=f"vlc_play_code_{result}")
+                return False
+            logger.info("Playing ad campaign %s", campaign_id)
+            return True
+        except Exception as exc:
+            logger.error("play_ad failed: %s", exc, exc_info=True)
+            await self._finish_ad_playback(completed=False, error=str(exc))
+            return False
+
+    async def _finish_ad_playback(
+        self,
+        *,
+        completed: bool = True,
+        error: Optional[str] = None,
+    ) -> None:
+        if not self._ad_playing and self._ad_campaign_id is None:
+            return
+
+        campaign_id = self._ad_campaign_id
+        duration = max(0.0, time.time() - self._ad_started_at) if self._ad_started_at else 0.0
+        self._ad_playing = False
+        self._ad_campaign_id = None
+        self._ad_started_at = 0.0
+
+        if self.on_ad_finished and campaign_id is not None:
+            try:
+                result = self.on_ad_finished(
+                    campaign_id=campaign_id,
+                    completed=completed,
+                    duration_played=duration,
+                    error=error,
+                )
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.error("on_ad_finished callback failed: %s", exc, exc_info=True)
+
+        if self._music_was_playing_before_ad and self.player:
+            try:
+                state = self.player.get_state()
+                if state == vlc.State.Paused:
+                    self.player.pause()
+                elif state != vlc.State.Playing:
+                    self.player.play()
+            except Exception as exc:
+                logger.warning("Could not resume music after ad: %s", exc)
+        self._music_was_playing_before_ad = False
+
     def _get_media_url(self, track: Dict[str, Any]) -> Optional[str]:
         source = track.get("source")
         source_url = track.get("source_url")
@@ -266,7 +414,7 @@ class MusicPlayer:
                 if path.exists():
                     return str(path.resolve())
             if source_url and not str(source_url).startswith("blob:"):
-                return source_url
+                return self._absolutize_url(str(source_url))
             return None
 
         if source == "youtube":
@@ -276,7 +424,7 @@ class MusicPlayer:
             return self._get_youtube_stream_url(str(youtube_url))
 
         if source_url:
-            return str(source_url)
+            return self._absolutize_url(str(source_url))
 
         return None
 
