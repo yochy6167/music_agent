@@ -498,6 +498,10 @@ class Agent:
             audio_url=command.get("audio_url") or "",
             campaign_id=int(campaign_id),
             audio_media_id=command.get("audio_media_id"),
+            campaign_name=command.get("campaign_name"),
+            play_type=command.get("play_type"),
+            schedule_config=command.get("schedule_config") or {},
+            from_track_end=False,
         )
 
     async def _on_ad_finished(
@@ -555,6 +559,10 @@ class Agent:
             audio_url=campaign.get("audio_url") or "",
             campaign_id=int(campaign["id"]),
             audio_media_id=campaign.get("audio_media_id"),
+            campaign_name=campaign.get("name"),
+            play_type="transition_between_songs",
+            schedule_config=campaign.get("schedule_config") or {},
+            from_track_end=True,
         )
 
     async def _handle_update_software(self, command: dict) -> None:
