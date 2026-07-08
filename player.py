@@ -348,10 +348,15 @@ class MusicPlayer:
             return f"{self.api_url}{url}"
         return f"{self.api_url}/{url.lstrip('/')}"
 
-    async def _download_to_cache(self, cache_key: int, url: str, dst: Path) -> bool:
+    async def _download_to_cache(
+        self, cache_key: int, url: str, dst: Path, timeout: float = 15.0
+    ) -> bool:
         try:
             headers = {"X-Device-Token": self.device_token}
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            # Short timeout: ad downloads run inline with playback decisions, so we'd
+            # rather fail fast and fall back to streaming than freeze for a long time.
+            client_timeout = httpx.Timeout(timeout, connect=5.0)
+            async with httpx.AsyncClient(timeout=client_timeout, follow_redirects=True) as client:
                 async with client.stream("GET", url, headers=headers) as response:
                     response.raise_for_status()
                     dst.parent.mkdir(parents=True, exist_ok=True)

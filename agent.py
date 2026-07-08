@@ -191,12 +191,14 @@ class WebSocketClient:
                     async for message in websocket:
                         try:
                             data = json.loads(message)
-                            if self.on_message:
-                                await self.on_message(data)
                         except json.JSONDecodeError:
                             logger.error("Invalid JSON message from WS")
-                        except Exception as exc:
-                            logger.error("WS message handler error: %s", exc)
+                            continue
+                        if self.on_message:
+                            # Handle in a background task so a slow command (e.g. an ad
+                            # download that stalls) never blocks this receive loop and
+                            # starves the connection's keepalive/message processing.
+                            asyncio.create_task(self._run_message_handler(data))
             except ConnectionClosed:
                 self.connected = False
                 if self.on_disconnect:
@@ -220,6 +222,12 @@ class WebSocketClient:
                 if self._running:
                     await asyncio.sleep(reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 1.5, 30)
+
+    async def _run_message_handler(self, data: Dict[str, Any]) -> None:
+        try:
+            await self.on_message(data)
+        except Exception as exc:
+            logger.error("WS message handler error: %s", exc)
 
     async def send(self, data: Dict[str, Any]) -> bool:
         if not self.connected or not self.websocket:
