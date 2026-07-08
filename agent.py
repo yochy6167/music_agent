@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -273,6 +274,9 @@ class Agent:
         self._transition_pick_index = 0
         self._ad_config_refresh_counter = 0
         self._ws_status_ticks = 0
+        self._command_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+        self._command_worker_task: Optional[asyncio.Task] = None
+        self._last_command_tick: float = 0.0
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -281,6 +285,9 @@ class Agent:
         self.player.on_ad_transition_check = self._on_ad_transition_check
         self.player.on_ad_finished = self._on_ad_finished
         await self._refresh_transition_campaigns()
+
+        self._command_worker_task = asyncio.create_task(self._command_worker())
+        asyncio.create_task(self._watchdog_loop())
 
         # In the current backend_unified WS implementation, agent status_update
         # messages are persisted to the DB server-side. Avoid duplicate HTTP
@@ -300,6 +307,63 @@ class Agent:
                     await self._heartbeat_task
                 except asyncio.CancelledError:
                     pass
+            if self._command_worker_task:
+                self._command_worker_task.cancel()
+
+    async def _command_worker(self) -> None:
+        """Process queued commands sequentially, each with its own timeout, so a
+        stuck command (e.g. a stalled ad download) can't block WS message
+        processing or other commands indefinitely."""
+        logger.info("Command worker started")
+        while self.running:
+            try:
+                command = await self._command_queue.get()
+                self._last_command_tick = time.time()
+                command_type = command.get("type")
+                action = command.get("action")
+
+                timeout_s = 30.0
+                if command_type == "ad_control":
+                    timeout_s = 25.0
+                elif (action or "").upper().replace("-", "_") == "UPDATE_SOFTWARE":
+                    timeout_s = 60.0
+
+                try:
+                    await asyncio.wait_for(self._handle_command(command), timeout=timeout_s)
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Command timed out after %.0fs: type=%s action=%s",
+                        timeout_s, command_type, action,
+                    )
+                except Exception as exc:
+                    logger.error("Command worker error: %s", exc)
+                finally:
+                    self._command_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Command worker outer error: %s", exc)
+                await asyncio.sleep(0.5)
+        logger.info("Command worker stopped")
+
+    async def _watchdog_loop(self) -> None:
+        """Detect a silently stalled command queue and log it, since a stuck
+        command shouldn't be able to hide silently."""
+        while self.running:
+            await asyncio.sleep(10.0)
+            now = time.time()
+            if self._command_queue.qsize() > 0 and self._last_command_tick and now - self._last_command_tick > 40:
+                logger.warning(
+                    "Watchdog: command queue stuck (size=%s) for %.0fs",
+                    self._command_queue.qsize(), now - self._last_command_tick,
+                )
+
+    async def _enqueue_commands(self, commands: list, *, source: str) -> None:
+        for command in commands:
+            await self._command_queue.put(command)
+        qs = self._command_queue.qsize()
+        if qs:
+            logger.info("Queued %s command(s) from %s (queue_size=%s)", len(commands), source, qs)
 
     async def _start_websocket_with_retries(self) -> None:
         reconnect_delay = 5
@@ -327,11 +391,11 @@ class Agent:
             if message_type == "pending_commands":
                 commands = data.get("commands", [])
                 if commands:
-                    await self._handle_commands(commands)
+                    await self._enqueue_commands(commands, source="ws_pending")
             elif message_type in {"playback_control", "volume_control", "agent_control", "ad_control"}:
-                await self._handle_command(data)
+                await self._enqueue_commands([data], source="ws_single")
             elif data.get("action"):
-                await self._handle_command(data)
+                await self._enqueue_commands([data], source="ws_single")
 
         def on_connect() -> None:
             self.is_connected = True
@@ -429,7 +493,7 @@ class Agent:
                 self.player.repeat_mode = response["repeat_mode"]
             commands = response.get("commands") or []
             if commands:
-                await self._handle_commands(commands)
+                await self._enqueue_commands(commands, source="long_poll")
 
             self._ad_config_refresh_counter += 1
             if self._ad_config_refresh_counter % 20 == 0:
