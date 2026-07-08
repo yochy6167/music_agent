@@ -181,6 +181,57 @@ amixer -c 0 sget 'PCM'
 
 ---
 
+## חלק ו׳ — גישה מרחוק מכל מקום (Tailscale)
+
+בעיה נפוצה: כדי להתחבר ל-Pi בסניף (SSH/לוגים/בדיקות) צריך להיות מחובר לאותה רשת Wi-Fi/Ethernet פיזית שלו. **Tailscale** פותר את זה — VPN רשתי חינמי שנותן ל-Pi כתובת IP קבועה שנגישה מכל מקום בעולם, בלי לפתוח פורטים בראוטר ובלי לגעת בקוד של `music_agent`.
+
+צריך להתקין את זה **פעם אחת בלבד** בזמן שאתה כבר על אותה רשת של הסניף (או פיזית מול ה-Pi) — מאז זה עובד לצמיתות מכל מקום, כולל אחרי `reboot`.
+
+### 1. התקנה על ה-Pi (בסניף, פעם אחת)
+
+בזמן שאתה מחובר לאותו Wi-Fi/רשת של הסניף:
+
+```bash
+ssh pi@music-agent-01.local
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --ssh
+```
+
+הפקודה תדפיס קישור להתחברות (`https://login.tailscale.com/a/...`) — פתח אותו בדפדפן בכל מכשיר (גם בנייד) והתחבר עם חשבון Google/Microsoft/GitHub. ה-Pi ירשם אוטומטית ל-tailnet שלך.
+
+הדגל `--ssh` מפעיל את שרת ה-SSH המובנה של Tailscale — כך אין צורך לנהל מפתחות SSH בנפרד; ההרשאה מתבססת על ההתחברות שלך ל-Tailscale.
+
+### 2. התקנה במחשב שלך (Windows)
+
+הורד והתקן את [Tailscale ל-Windows](https://tailscale.com/download/windows), והתחבר **עם אותו חשבון** שהשתמשת בו ב-Pi.
+
+### 3. חיבור מכל מקום
+
+ברגע ששני המכשירים מחוברים לאותו tailnet:
+
+```bash
+# מציאת כתובת ה-Tailscale של ה-Pi (הרץ פעם אחת על ה-Pi)
+tailscale ip -4
+
+# מהמחשב שלך, מכל רשת (גם ביתית, גם סלולרית) — לפי IP:
+ssh pi@100.x.x.x
+
+# או לפי hostname, אם הפעלת MagicDNS בפאנל הניהול של Tailscale:
+ssh pi@music-agent-01
+```
+
+את `journalctl -u music_agent -f` ופקודות הבדיקה מהחלק הקודם אפשר להריץ בדיוק כרגיל אחרי שמחוברים כך.
+
+### 4. שים לב — מכשיר ללא השגחה
+
+מכיוון שה-Pi לא נגיש פיזית באופן שוטף:
+
+- בפאנל הניהול של Tailscale ([login.tailscale.com/admin/machines](https://login.tailscale.com/admin/machines)) — כדאי לכבות **Key Expiry** עבור מכשיר ה-Pi (לחיצה על שלוש הנקודות ליד המכשיר → Disable key expiry), אחרת אחרי כמה חודשים הוא ידרוש אימות מחדש ותאבד גישה עד שתגיע פיזית.
+- Tailscale רץ כשירות `systemd` (`tailscaled`) שעולה אוטומטית ב-boot — אין צורך בהגדרה נוספת, כולל אחרי הפעלה מחדש של ה-Pi.
+- לבדיקת סטטוס בכל שלב: `tailscale status`.
+
+---
+
 ## מכשירים נוספים
 
 לכל Pi:
@@ -200,6 +251,7 @@ amixer -c 0 sget 'PCM'
 | השירות נופל | `journalctl -u music_agent -n 50` |
 | אין סידורי Pi בלוג | `cat /proc/cpuinfo \| grep Serial` — אם `00000000`, עדכן EEPROM/firmware |
 | VLC / נגינה | `sudo apt install vlc libvlc-dev` ואז `bash setup.sh` שוב |
+| Tailscale לא מתחבר / IP לא עונה | `sudo tailscale status` על ה-Pi; ודא שהמכשיר לא "Expired" בפאנל הניהול (כבה Key Expiry) |
 
 ---
 
