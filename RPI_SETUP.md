@@ -130,6 +130,17 @@ journalctl -u music_agent -f
 | לוגים | `journalctl -u music_agent -f` |
 | עדכון קוד | `./scripts/deploy-from-pc.sh pi@music-agent-01.local` |
 | גרסת סוכן | בשורה הראשונה בלוג: `--- Version 2.0.0 ---` |
+| טיימר ריבוט לילי | `systemctl list-timers music-agent-nightly-reboot.timer` |
+| ביטול ריבוט לילי | `sudo systemctl disable --now music-agent-nightly-reboot.timer` |
+
+### ריבוט יומי בחצות
+
+`setup.sh` מתקין טיימר systemd:
+
+- **`music-agent-nightly-reboot.timer`** — `OnCalendar=*-*-* 00:00:00` (שעון מקומי של ה-Pi)
+- מריץ reboot מלא — הסוכן עולה שוב אוטומטית אחרי boot
+
+ודא ש-timezone נכון (`timedatectl` → `Asia/Jerusalem`).
 
 ### אודיו (חיבור רמקולים)
 

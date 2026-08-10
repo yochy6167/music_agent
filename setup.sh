@@ -143,6 +143,37 @@ sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE_NAME}"
 sudo systemctl start "${SERVICE_NAME}"
 
+echo "Configuring nightly reboot (00:00 local time)..."
+REBOOT_SERVICE="/etc/systemd/system/music-agent-nightly-reboot.service"
+REBOOT_TIMER="/etc/systemd/system/music-agent-nightly-reboot.timer"
+
+sudo tee "$REBOOT_SERVICE" > /dev/null <<'EOF'
+[Unit]
+Description=Nightly reboot for Neeman Music Agent Pi
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/systemctl reboot
+EOF
+
+sudo tee "$REBOOT_TIMER" > /dev/null <<'EOF'
+[Unit]
+Description=Reboot music agent Pi every night at midnight
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+Persistent=true
+Unit=music-agent-nightly-reboot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now music-agent-nightly-reboot.timer
+echo "Nightly reboot timer enabled (local midnight)."
+systemctl list-timers music-agent-nightly-reboot.timer --no-pager 2>/dev/null || true
+
 echo "Running quick health checks..."
 python3 -V
 ${PYTHON_BIN} -c "import httpx, websockets; print('python deps: ok')"

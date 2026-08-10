@@ -56,6 +56,8 @@ class MusicPlayer:
         self._ad_after_finish_action: Optional[str] = None
         self._ad_campaign_name: Optional[str] = None
         self._ad_schedule_config: dict = {}
+        self._expect_playing = False
+        self._stall_since: Optional[float] = None
 
         self._init_vlc()
 
@@ -163,26 +165,33 @@ class MusicPlayer:
             if self.current_index >= len(self.current_playlist):
                 self.current_index = 0
 
+        self._expect_playing = True
         await self._play_current_track()
 
     async def pause(self) -> None:
         if self.player:
             self.player.pause()
+            self._expect_playing = False
+            self._stall_since = None
 
     async def stop(self) -> None:
         if self.player:
             self.player.stop()
+            self._expect_playing = False
+            self._stall_since = None
 
     async def next(self) -> None:
         if not self.current_playlist:
             return
         self.current_index = (self.current_index + 1) % len(self.current_playlist)
+        self._expect_playing = True
         await self._play_current_track()
 
     async def previous(self) -> None:
         if not self.current_playlist:
             return
         self.current_index = (self.current_index - 1) % len(self.current_playlist)
+        self._expect_playing = True
         await self._play_current_track()
 
     async def seek(self, position_seconds: float) -> None:
@@ -263,14 +272,23 @@ class MusicPlayer:
                 return
         logger.warning("Track %s not found in playlist", track_id)
 
-    async def _play_current_track(self) -> None:
+    async def _play_current_track(self, *, _skip_depth: int = 0) -> None:
         if not self.current_playlist or not self.player:
             return
+        if _skip_depth >= min(len(self.current_playlist), 12):
+            logger.error(
+                "Too many unplayable tracks in a row (%s); stopping auto-advance",
+                _skip_depth,
+            )
+            self._expect_playing = False
+            return
+
         track = self.current_playlist[self.current_index]
-        media_url = self._get_media_url(track)
+        media_url = await self._get_media_url(track)
         if not media_url:
             logger.warning("No playable URL, skipping track %s", track.get("id"))
-            await self.next()
+            self.current_index = (self.current_index + 1) % len(self.current_playlist)
+            await self._play_current_track(_skip_depth=_skip_depth + 1)
             return
 
         media = self.instance.media_new(media_url)
@@ -279,7 +297,43 @@ class MusicPlayer:
         await asyncio.sleep(0.3)
         self.current_track_id = track.get("id")
         self.current_track = track
+        self._expect_playing = True
+        self._stall_since = None
         logger.info("Playing track %s", self.current_track_id)
+
+    async def recover_if_stalled(self, stall_seconds: float = 20.0) -> bool:
+        """If we expect music but VLC is Ended/Error for long enough, advance."""
+        if not self.player or not self._expect_playing or self._ad_playing:
+            self._stall_since = None
+            return False
+        if not self.current_playlist:
+            return False
+
+        try:
+            state = self.player.get_state()
+        except Exception:
+            return False
+
+        stalled_states = {vlc.State.Ended, vlc.State.Error} if vlc else set()
+        if state not in stalled_states:
+            self._stall_since = None
+            return False
+
+        now = time.time()
+        if self._stall_since is None:
+            self._stall_since = now
+            return False
+        if now - self._stall_since < stall_seconds:
+            return False
+
+        logger.warning(
+            "Playback stalled (vlc_state=%s) for %.0fs — advancing to next track",
+            getattr(state, "name", state),
+            now - self._stall_since,
+        )
+        self._stall_since = None
+        await self.next()
+        return True
 
     def _on_track_end(self, event: Any) -> None:
         if self._event_loop and self._event_loop.is_running():
@@ -705,7 +759,7 @@ class MusicPlayer:
         self._ad_pre_music_volume = None
         self._ad_saved_position_ms = None
 
-    def _get_media_url(self, track: Dict[str, Any]) -> Optional[str]:
+    async def _get_media_url(self, track: Dict[str, Any]) -> Optional[str]:
         source = track.get("source")
         source_url = track.get("source_url")
         source_id = track.get("source_id")
@@ -724,31 +778,41 @@ class MusicPlayer:
             youtube_url = source_url or (f"https://www.youtube.com/watch?v={source_id}" if source_id else None)
             if not youtube_url:
                 return None
-            return self._get_youtube_stream_url(str(youtube_url))
+            return await self._get_youtube_stream_url(str(youtube_url))
 
         if source_url:
             return self._absolutize_url(str(source_url))
 
         return None
 
-    def _get_youtube_stream_url(self, youtube_url: str) -> Optional[str]:
+    async def _get_youtube_stream_url(self, youtube_url: str) -> Optional[str]:
+        # yt-dlp is blocking/CPU-heavy on Pi — never run it on the asyncio loop.
         try:
-            import yt_dlp
-
-            ydl_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "skip_download": True,
-                "format": "bestaudio/best",
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(youtube_url, download=False)
-                if "url" in info:
-                    return info["url"]
-                if "formats" in info and info["formats"]:
-                    return info["formats"][-1].get("url")
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._extract_youtube_url_sync, youtube_url),
+                timeout=45.0,
+            )
+        except asyncio.TimeoutError:
+            logger.error("yt-dlp timed out for %s", youtube_url)
             return None
         except Exception as exc:
             logger.error("yt-dlp error: %s", exc)
             return None
+
+    def _extract_youtube_url_sync(self, youtube_url: str) -> Optional[str]:
+        import yt_dlp
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": True,
+            "format": "bestaudio/best",
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=False)
+            if "url" in info:
+                return info["url"]
+            if "formats" in info and info["formats"]:
+                return info["formats"][-1].get("url")
+        return None

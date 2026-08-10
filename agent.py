@@ -347,8 +347,7 @@ class Agent:
         logger.info("Command worker stopped")
 
     async def _watchdog_loop(self) -> None:
-        """Detect a silently stalled command queue and log it, since a stuck
-        command shouldn't be able to hide silently."""
+        """Detect stalled command queue / stalled playback and recover."""
         while self.running:
             await asyncio.sleep(10.0)
             now = time.time()
@@ -357,6 +356,12 @@ class Agent:
                     "Watchdog: command queue stuck (size=%s) for %.0fs",
                     self._command_queue.qsize(), now - self._last_command_tick,
                 )
+            try:
+                recovered = await self.player.recover_if_stalled(stall_seconds=20.0)
+                if recovered:
+                    logger.info("Watchdog recovered stalled playback")
+            except Exception as exc:
+                logger.warning("Playback stall watchdog failed: %s", exc)
 
     async def _enqueue_commands(self, commands: list, *, source: str) -> None:
         for command in commands:
@@ -417,9 +422,10 @@ class Agent:
 
         # Adaptive WS cadence:
         # - While playing, send anchors frequently so the dashboard timeline stays accurate.
-        # - While idle, send infrequent keepalive updates.
+        # - While idle, still send keepalive status_update every tick so dashboard
+        #   last_seen / "alive" does not go stale (HTTP heartbeat is disabled when WS is on).
         playing_interval_s = 5
-        idle_interval_s = 30
+        idle_interval_s = 20
 
         while self.running:
             if not (self.ws_client and self.ws_client.connected):
@@ -444,28 +450,12 @@ class Agent:
                 "playback_speed": 1.0,
             }
 
-            send_now = False
-            if self._last_ws_payload is None:
-                send_now = True
-            else:
-                keys = [
-                    "status",
-                    "current_volume",
-                    "is_playing",
-                    "current_track_id",
-                    "current_playlist_id",
-                ]
-                if any(self._last_ws_payload.get(k) != payload.get(k) for k in keys):
-                    send_now = True
-
-            if is_playing:
-                send_now = True
-
-            if send_now:
-                ok = await self.ws_client.send(payload)
-                if not ok:
-                    break
-                self._last_ws_payload = payload
+            # Always send on every tick. Previously idle ticks skipped unchanged
+            # payloads, so the device looked offline until volume/play changed.
+            ok = await self.ws_client.send(payload)
+            if not ok:
+                break
+            self._last_ws_payload = payload
 
             self._ws_status_ticks += 1
             if self._ws_status_ticks % 20 == 0:
@@ -558,6 +548,25 @@ class Agent:
         volume = command.get("volume")
         if volume is not None:
             await self.player.set_volume(volume)
+            # Push status immediately so dashboard "alive"/volume refresh
+            # does not wait for the next WS keepalive tick.
+            if self.ws_client and self.ws_client.connected:
+                status = await self.player.get_status()
+                payload = {
+                    "type": "status_update",
+                    "status": "healthy" if self.player.is_healthy() else "error",
+                    "current_volume": status.get("volume", 50.0),
+                    "is_playing": bool(status.get("is_playing", False)),
+                    "current_track_id": status.get("current_track_id"),
+                    "current_playlist_id": status.get("current_playlist_id"),
+                    "current_track": status.get("current_track"),
+                    "track_position": status.get("track_position"),
+                    "playback_position": float(status.get("playback_position") or 0.0),
+                    "playback_length": float(status.get("playback_length") or 0.0),
+                    "playback_speed": 1.0,
+                }
+                await self.ws_client.send(payload)
+                self._last_ws_payload = payload
 
     async def _handle_ad_control(self, command: dict) -> None:
         if command.get("action") != "play":
