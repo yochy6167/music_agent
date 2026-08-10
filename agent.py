@@ -409,7 +409,7 @@ class Agent:
                     self._control_queue.qsize(), now - self._last_command_tick,
                 )
             try:
-                recovered = await self.player.recover_if_stalled(stall_seconds=20.0)
+                recovered = await self.player.recover_if_stalled(stall_seconds=8.0)
                 if recovered:
                     logger.info("Watchdog recovered stalled playback")
             except Exception as exc:

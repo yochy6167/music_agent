@@ -94,9 +94,20 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python3"
 VOLUME_SCRIPT="${SCRIPT_DIR}/scripts/set-system-volume.sh"
 
-# Headless Pi: run PipeWire/Pulse for user ${USER} at boot (needed for pactl + VLC).
+# If setup was run with sudo, prefer the real login user (not root).
+SERVICE_USER="${SUDO_USER:-${USER}}"
+if [[ -z "${SERVICE_USER}" || "${SERVICE_USER}" == "root" ]]; then
+  SERVICE_USER="$(logname 2>/dev/null || true)"
+fi
+if [[ -z "${SERVICE_USER}" || "${SERVICE_USER}" == "root" ]]; then
+  SERVICE_USER="pi"
+fi
+SERVICE_UID="$(id -u "${SERVICE_USER}" 2>/dev/null || echo 1000)"
+echo "systemd service will run as user: ${SERVICE_USER} (uid ${SERVICE_UID})"
+
+# Headless Pi: run PipeWire/Pulse for user at boot (needed for pactl + VLC).
 if command -v loginctl >/dev/null 2>&1; then
-  sudo loginctl enable-linger "${USER}" 2>/dev/null || true
+  sudo loginctl enable-linger "${SERVICE_USER}" 2>/dev/null || true
 fi
 
 WSL_AUDIO_ENV=""
@@ -115,12 +126,12 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=${USER}
+User=${SERVICE_USER}
 WorkingDirectory=${SCRIPT_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=SYSTEM_SINK_VOLUME=90
 Environment=AUDIO_PREFER=auto
-Environment=XDG_RUNTIME_DIR=/run/user/%u
+Environment=XDG_RUNTIME_DIR=/run/user/${SERVICE_UID}
 ${WSL_AUDIO_ENV}
 ExecStartPre=/bin/bash ${VOLUME_SCRIPT}
 ExecStart=${PYTHON_BIN} ${SCRIPT_DIR}/main.py
@@ -133,10 +144,10 @@ WantedBy=multi-user.target
 EOF
 
 echo "Adding user to audio and video groups..."
-sudo usermod -aG audio,video "${USER}"
+sudo usermod -aG audio,video "${SERVICE_USER}"
 
 echo "Setting default system sink volume (PulseAudio/PipeWire)..."
-"${VOLUME_SCRIPT}" || true
+sudo -u "${SERVICE_USER}" XDG_RUNTIME_DIR="/run/user/${SERVICE_UID}" /bin/bash "${VOLUME_SCRIPT}" || true
 
 echo "Enabling and starting service..."
 sudo systemctl daemon-reload
