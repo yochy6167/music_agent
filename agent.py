@@ -165,6 +165,9 @@ class WebSocketClient:
         self.on_connect: Optional[Callable[[], Any]] = None
         self.on_disconnect: Optional[Callable[[], Any]] = None
         self._running = False
+        self._outbound: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue(maxsize=100)
+        self._sender_task: Optional[asyncio.Task] = None
+        self._pending_status: Optional[Dict[str, Any]] = None
 
     async def connect(self) -> None:
         if self.connected:
@@ -188,19 +191,33 @@ class WebSocketClient:
                     self.websocket = websocket
                     self.connected = True
                     reconnect_delay = 3
+                    # Drain stale outbound messages from a previous connection.
+                    while not self._outbound.empty():
+                        try:
+                            self._outbound.get_nowait()
+                            self._outbound.task_done()
+                        except asyncio.QueueEmpty:
+                            break
+                    self._sender_task = asyncio.create_task(self._sender_loop())
                     if self.on_connect:
                         self.on_connect()
-                    async for message in websocket:
-                        try:
-                            data = json.loads(message)
-                        except json.JSONDecodeError:
-                            logger.error("Invalid JSON message from WS")
-                            continue
-                        if self.on_message:
-                            # Handle in a background task so a slow command (e.g. an ad
-                            # download that stalls) never blocks this receive loop and
-                            # starves the connection's keepalive/message processing.
-                            asyncio.create_task(self._run_message_handler(data))
+                    try:
+                        async for message in websocket:
+                            try:
+                                data = json.loads(message)
+                            except json.JSONDecodeError:
+                                logger.error("Invalid JSON message from WS")
+                                continue
+                            if self.on_message:
+                                asyncio.create_task(self._run_message_handler(data))
+                    finally:
+                        if self._sender_task:
+                            self._sender_task.cancel()
+                            try:
+                                await self._sender_task
+                            except asyncio.CancelledError:
+                                pass
+                            self._sender_task = None
             except ConnectionClosed:
                 self.connected = False
                 if self.on_disconnect:
@@ -231,20 +248,80 @@ class WebSocketClient:
         except Exception as exc:
             logger.error("WS message handler error: %s", exc)
 
+    async def _sender_loop(self) -> None:
+        """Single writer — prevents concurrent send deadlocks with WS pings."""
+        while self._running and self.connected:
+            try:
+                data = await self._outbound.get()
+            except asyncio.CancelledError:
+                break
+            if data is None:
+                self._outbound.task_done()
+                break
+            try:
+                if data.get("type") == "_flush_status":
+                    data = self._pending_status
+                    self._pending_status = None
+                    if not data:
+                        self._outbound.task_done()
+                        continue
+                if not self.websocket or not self.connected:
+                    self._outbound.task_done()
+                    break
+                raw = json.dumps(data, ensure_ascii=False, default=str)
+                await asyncio.wait_for(self.websocket.send(raw), timeout=8.0)
+            except asyncio.TimeoutError:
+                logger.error("WS send timed out — marking disconnected")
+                self.connected = False
+                self._outbound.task_done()
+                try:
+                    if self.websocket:
+                        await self.websocket.close()
+                except Exception:
+                    pass
+                break
+            except asyncio.CancelledError:
+                self._outbound.task_done()
+                break
+            except Exception as exc:
+                logger.error("WS send error: %s", exc)
+                self.connected = False
+                self._outbound.task_done()
+                break
+            else:
+                self._outbound.task_done()
+
     async def send(self, data: Dict[str, Any]) -> bool:
-        if not self.connected or not self.websocket:
+        if not self.connected:
             return False
+        # Coalesce status updates: keep only the newest payload.
+        if data.get("type") == "status_update":
+            self._pending_status = data
+            data = {"type": "_flush_status"}
         try:
-            await self.websocket.send(json.dumps(data))
+            self._outbound.put_nowait(data)
             return True
-        except Exception as exc:
-            logger.error("WS send error: %s", exc)
-            self.connected = False
+        except asyncio.QueueFull:
+            if data.get("type") == "_flush_status":
+                # Status still stored in _pending_status; next flush will send it.
+                return True
+            logger.warning("WS outbound queue full — dropping message type=%s", data.get("type"))
             return False
 
     async def disconnect(self) -> None:
         self._running = False
         self.connected = False
+        try:
+            self._outbound.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+        if self._sender_task:
+            self._sender_task.cancel()
+            try:
+                await self._sender_task
+            except asyncio.CancelledError:
+                pass
+            self._sender_task = None
         if self.websocket:
             try:
                 await self.websocket.close()
@@ -293,11 +370,9 @@ class Agent:
         self._control_worker_task = asyncio.create_task(self._control_worker())
         asyncio.create_task(self._watchdog_loop())
 
-        # In the current backend_unified WS implementation, agent status_update
-        # messages are persisted to the DB server-side. Avoid duplicate HTTP
-        # heartbeats when WS is enabled (reduces load and improves resiliency).
-        if not self.config.ws_url:
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # Always keep a light HTTP heartbeat as last_seen backup. WS status_update is
+        # primary, but if the WS send path wedges the dashboard still sees the device.
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
             if self.config.ws_url:
                 await self._start_websocket_with_retries()
@@ -416,9 +491,20 @@ class Agent:
                 logger.warning("Playback stall watchdog failed: %s", exc)
 
     async def _enqueue_commands(self, commands: list, *, source: str) -> None:
+        # Coalesce floods (especially volume after WS reconnect): keep last volume only.
+        last_volume: Optional[dict] = None
+        filtered: list = []
+        for command in commands:
+            if command.get("type") == "volume_control":
+                last_volume = command
+                continue
+            filtered.append(command)
+        if last_volume is not None:
+            filtered.append(last_volume)
+
         control_n = 0
         heavy_n = 0
-        for command in commands:
+        for command in filtered:
             if self._is_priority_control(command):
                 await self._control_queue.put(command)
                 control_n += 1
@@ -508,17 +594,23 @@ class Agent:
                 "is_playing": is_playing,
                 "current_track_id": status.get("current_track_id"),
                 "current_playlist_id": status.get("current_playlist_id"),
-                "current_track": status.get("current_track"),
+                # Keep payload small — full track metadata is not needed every tick.
                 "track_position": status.get("track_position"),
                 "playback_position": float(pos) if pos is not None else 0.0,
                 "playback_length": float(length) if length is not None else 0.0,
                 "playback_speed": 1.0,
             }
+            # Include current_track only when it changes (less WS/CPU load on Pi).
+            if (
+                self._last_ws_payload is None
+                or self._last_ws_payload.get("current_track_id") != payload.get("current_track_id")
+            ):
+                payload["current_track"] = status.get("current_track")
 
-            # Always send on every tick. Previously idle ticks skipped unchanged
-            # payloads, so the device looked offline until volume/play changed.
+            # Always send on every tick (coalesced by WS sender). Cadence:
+            # playing every 5s, idle every 20s (keepalive for dashboard last_seen).
             ok = await self.ws_client.send(payload)
-            if not ok:
+            if not ok or not self.ws_client.connected:
                 break
             self._last_ws_payload = payload
 
@@ -614,8 +706,7 @@ class Agent:
         volume = command.get("volume")
         if volume is not None:
             await self.player.set_volume(volume)
-            # Push status immediately so dashboard "alive"/volume refresh
-            # does not wait for the next WS keepalive tick.
+            # Non-blocking: queue a slim status update (sender coalesces duplicates).
             if self.ws_client and self.ws_client.connected:
                 status = await self.player.get_status()
                 payload = {
@@ -625,7 +716,6 @@ class Agent:
                     "is_playing": bool(status.get("is_playing", False)),
                     "current_track_id": status.get("current_track_id"),
                     "current_playlist_id": status.get("current_playlist_id"),
-                    "current_track": status.get("current_track"),
                     "track_position": status.get("track_position"),
                     "playback_position": float(status.get("playback_position") or 0.0),
                     "playback_length": float(status.get("playback_length") or 0.0),
@@ -633,6 +723,7 @@ class Agent:
                 }
                 await self.ws_client.send(payload)
                 self._last_ws_payload = payload
+            logger.info("Volume set to %s", volume)
 
     async def _handle_ad_control(self, command: dict) -> None:
         if command.get("action") != "play":
@@ -821,12 +912,10 @@ class Agent:
     async def _heartbeat_loop(self) -> None:
         while self.running:
             try:
+                # Backup last_seen for the dashboard when WS is quiet/wedged.
                 await asyncio.sleep(30)
                 status = await self.player.get_status()
                 await self.client.send_heartbeat(self._build_heartbeat(status))
-                self._ad_config_refresh_counter += 1
-                if self._ad_config_refresh_counter % 20 == 0:
-                    await self._refresh_transition_campaigns()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -839,7 +928,6 @@ class Agent:
             "is_playing": status.get("is_playing", False),
             "current_track_id": status.get("current_track_id"),
             "current_playlist_id": status.get("current_playlist_id"),
-            "current_track": status.get("current_track"),
             "track_position": status.get("track_position"),
             "playback_position": status.get("playback_position"),
             "playback_length": status.get("playback_length"),
