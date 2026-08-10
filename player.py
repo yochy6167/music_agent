@@ -78,9 +78,11 @@ class MusicPlayer:
         ]
         vlc_options.extend(
             [
-                "--file-caching=3000",
-                "--network-caching=5000",
-                "--clock-jitter=500",
+                "--file-caching=5000",
+                "--network-caching=10000",
+                "--live-caching=5000",
+                "--clock-jitter=0",
+                "--clock-synchro=0",
             ]
         )
         if platform.system() == "Windows":
@@ -165,14 +167,55 @@ class MusicPlayer:
             if self.current_index >= len(self.current_playlist):
                 self.current_index = 0
 
+        target = self.current_playlist[self.current_index]
+        target_id = target.get("id")
+        try:
+            state = self.player.get_state()
+        except Exception:
+            state = None
+
+        # Idempotent play: don't re-resolve YouTube if already on this track.
+        same_track = (
+            target_id is not None
+            and self.current_track_id is not None
+            and str(target_id) == str(self.current_track_id)
+        )
+        if same_track and vlc and state == vlc.State.Playing:
+            logger.info("Already playing track %s — ignoring duplicate play", target_id)
+            self._expect_playing = True
+            return
+        if same_track and vlc and state == vlc.State.Paused:
+            logger.info("Resuming paused track %s", target_id)
+            self.player.set_pause(False)
+            self._expect_playing = True
+            self._stall_since = None
+            return
+
         self._expect_playing = True
         await self._play_current_track()
 
     async def pause(self) -> None:
-        if self.player:
-            self.player.pause()
+        if not self.player:
+            return
+        try:
+            state = self.player.get_state()
+        except Exception:
+            state = None
+        # libvlc pause() TOGGLES — must use set_pause(True) or duplicate
+        # pause commands from the dashboard resume playback unexpectedly.
+        if vlc and state == vlc.State.Paused:
+            logger.info("Already paused — ignoring duplicate pause")
             self._expect_playing = False
             self._stall_since = None
+            return
+        if vlc and state in (vlc.State.Stopped, vlc.State.Ended, vlc.State.Error):
+            self._expect_playing = False
+            self._stall_since = None
+            return
+        self.player.set_pause(True)
+        self._expect_playing = False
+        self._stall_since = None
+        logger.info("Paused playback")
 
     async def stop(self) -> None:
         if self.player:
