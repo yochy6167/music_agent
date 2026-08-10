@@ -215,7 +215,16 @@ class MusicPlayer:
         }
 
         state = self.player.get_state()
-        is_playing = state == vlc.State.Playing
+        # Treat Buffering/Opening as playing so the dashboard doesn't flicker "stopped"
+        # during network hiccups while audio is still coming out of the buffer.
+        if vlc and state in (vlc.State.Playing, vlc.State.Buffering, vlc.State.Opening):
+            is_playing = True
+        elif vlc and state in (vlc.State.Ended, vlc.State.Error):
+            is_playing = False
+        elif vlc and state == vlc.State.Stopped:
+            is_playing = False
+        else:
+            is_playing = bool(self._expect_playing)
         position_sec = max(self.player.get_time() / 1000.0, 0.0)
         if self._ad_playing and self._ad_overlay_mode == "fade_pause":
             is_playing = False
@@ -786,33 +795,51 @@ class MusicPlayer:
         return None
 
     async def _get_youtube_stream_url(self, youtube_url: str) -> Optional[str]:
-        # yt-dlp is blocking/CPU-heavy on Pi — never run it on the asyncio loop.
+        # CRITICAL: yt-dlp is pure-Python and holds the GIL. asyncio.to_thread is NOT
+        # enough — it freezes heartbeats/WS pings/commands on the Pi for minutes.
+        # Run extraction in a separate *process* via the yt-dlp CLI instead.
+        logger.info("Resolving YouTube URL via subprocess: %s", youtube_url)
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self._extract_youtube_url_sync, youtube_url),
-                timeout=45.0,
+                self._extract_youtube_url_subprocess(youtube_url),
+                timeout=60.0,
             )
         except asyncio.TimeoutError:
-            logger.error("yt-dlp timed out for %s", youtube_url)
+            logger.error("yt-dlp subprocess timed out for %s", youtube_url)
             return None
         except Exception as exc:
-            logger.error("yt-dlp error: %s", exc)
+            logger.error("yt-dlp subprocess error: %s", exc)
             return None
 
-    def _extract_youtube_url_sync(self, youtube_url: str) -> Optional[str]:
-        import yt_dlp
+    async def _extract_youtube_url_subprocess(self, youtube_url: str) -> Optional[str]:
+        import sys
 
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "skip_download": True,
-            "format": "bestaudio/best",
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(youtube_url, download=False)
-            if "url" in info:
-                return info["url"]
-            if "formats" in info and info["formats"]:
-                return info["formats"][-1].get("url")
+        cmd = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--quiet",
+            "--no-warnings",
+            "--no-playlist",
+            "--skip-download",
+            "-f",
+            "bestaudio/best",
+            "-g",
+            youtube_url,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err = (stderr or b"").decode(errors="replace").strip()
+            logger.error("yt-dlp exited %s: %s", proc.returncode, err[:500])
+            return None
+        lines = (stdout or b"").decode(errors="replace").strip().splitlines()
+        for line in lines:
+            url = line.strip()
+            if url.startswith("http://") or url.startswith("https://"):
+                return url
         return None

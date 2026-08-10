@@ -181,8 +181,9 @@ class WebSocketClient:
                 async with websockets.connect(
                     url,
                     ping_interval=20,
-                    ping_timeout=10,
+                    ping_timeout=60,
                     close_timeout=10,
+                    max_queue=64,
                 ) as websocket:
                     self.websocket = websocket
                     self.connected = True
@@ -275,7 +276,9 @@ class Agent:
         self._ad_config_refresh_counter = 0
         self._ws_status_ticks = 0
         self._command_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+        self._control_queue: "asyncio.Queue[dict]" = asyncio.Queue()
         self._command_worker_task: Optional[asyncio.Task] = None
+        self._control_worker_task: Optional[asyncio.Task] = None
         self._last_command_tick: float = 0.0
 
     async def start(self) -> None:
@@ -287,6 +290,7 @@ class Agent:
         await self._refresh_transition_campaigns()
 
         self._command_worker_task = asyncio.create_task(self._command_worker())
+        self._control_worker_task = asyncio.create_task(self._control_worker())
         asyncio.create_task(self._watchdog_loop())
 
         # In the current backend_unified WS implementation, agent status_update
@@ -309,6 +313,44 @@ class Agent:
                     pass
             if self._command_worker_task:
                 self._command_worker_task.cancel()
+            if self._control_worker_task:
+                self._control_worker_task.cancel()
+
+    def _is_priority_control(self, command: dict) -> bool:
+        command_type = command.get("type")
+        action = (command.get("action") or "").lower()
+        if command_type == "volume_control":
+            return True
+        if command_type == "playback_control" and action in {"pause", "stop"}:
+            return True
+        return False
+
+    async def _control_worker(self) -> None:
+        """Fast path for volume/pause/stop — never blocked behind yt-dlp/play."""
+        logger.info("Control worker started")
+        while self.running:
+            try:
+                command = await self._control_queue.get()
+                self._last_command_tick = time.time()
+                try:
+                    logger.info(
+                        "Handling control command: type=%s action=%s",
+                        command.get("type"),
+                        command.get("action"),
+                    )
+                    await asyncio.wait_for(self._handle_command(command), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.error("Control command timed out: %s", command.get("type"))
+                except Exception as exc:
+                    logger.error("Control worker error: %s", exc)
+                finally:
+                    self._control_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Control worker outer error: %s", exc)
+                await asyncio.sleep(0.5)
+        logger.info("Control worker stopped")
 
     async def _command_worker(self) -> None:
         """Process queued commands sequentially, each with its own timeout, so a
@@ -321,12 +363,17 @@ class Agent:
                 self._last_command_tick = time.time()
                 command_type = command.get("type")
                 action = command.get("action")
+                logger.info("Handling command: type=%s action=%s", command_type, action)
 
                 timeout_s = 30.0
                 if command_type == "ad_control":
                     timeout_s = 25.0
                 elif (action or "").upper().replace("-", "_") == "UPDATE_SOFTWARE":
                     timeout_s = 60.0
+                elif command_type == "playback_control" and (action or "").lower() in {"play", "next", "skip", "previous"}:
+                    # YouTube resolve can take a while on Pi; don't kill it too early,
+                    # but never exceed this — subprocess yt-dlp has its own timeout.
+                    timeout_s = 70.0
 
                 try:
                     await asyncio.wait_for(self._handle_command(command), timeout=timeout_s)
@@ -353,8 +400,13 @@ class Agent:
             now = time.time()
             if self._command_queue.qsize() > 0 and self._last_command_tick and now - self._last_command_tick > 40:
                 logger.warning(
-                    "Watchdog: command queue stuck (size=%s) for %.0fs",
+                    "Watchdog: heavy command queue stuck (size=%s) for %.0fs",
                     self._command_queue.qsize(), now - self._last_command_tick,
+                )
+            if self._control_queue.qsize() > 0 and self._last_command_tick and now - self._last_command_tick > 20:
+                logger.warning(
+                    "Watchdog: control queue stuck (size=%s) for %.0fs",
+                    self._control_queue.qsize(), now - self._last_command_tick,
                 )
             try:
                 recovered = await self.player.recover_if_stalled(stall_seconds=20.0)
@@ -364,11 +416,24 @@ class Agent:
                 logger.warning("Playback stall watchdog failed: %s", exc)
 
     async def _enqueue_commands(self, commands: list, *, source: str) -> None:
+        control_n = 0
+        heavy_n = 0
         for command in commands:
-            await self._command_queue.put(command)
-        qs = self._command_queue.qsize()
-        if qs:
-            logger.info("Queued %s command(s) from %s (queue_size=%s)", len(commands), source, qs)
+            if self._is_priority_control(command):
+                await self._control_queue.put(command)
+                control_n += 1
+            else:
+                await self._command_queue.put(command)
+                heavy_n += 1
+        if control_n or heavy_n:
+            logger.info(
+                "Queued %s control + %s heavy command(s) from %s (control_q=%s heavy_q=%s)",
+                control_n,
+                heavy_n,
+                source,
+                self._control_queue.qsize(),
+                self._command_queue.qsize(),
+            )
 
     async def _start_websocket_with_retries(self) -> None:
         reconnect_delay = 5
@@ -459,7 +524,8 @@ class Agent:
 
             self._ws_status_ticks += 1
             if self._ws_status_ticks % 20 == 0:
-                await self._refresh_transition_campaigns()
+                # Never block keepalive/status sends on ads config HTTP.
+                asyncio.create_task(self._refresh_transition_campaigns())
 
             await asyncio.sleep(playing_interval_s if is_playing else idle_interval_s)
 
