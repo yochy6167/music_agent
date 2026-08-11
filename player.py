@@ -82,13 +82,16 @@ class MusicPlayer:
             "--no-xlib",
             "--quiet",
         ]
+        # Prefer larger network cache: YouTube DASH (esp. webm/opus) underruns easily on Pi.
         vlc_options.extend(
             [
-                "--file-caching=5000",
-                "--network-caching=10000",
-                "--live-caching=5000",
+                "--file-caching=8000",
+                "--network-caching=30000",
+                "--live-caching=8000",
                 "--clock-jitter=0",
                 "--clock-synchro=0",
+                "--http-reconnect",
+                "--sout-mux-caching=8000",
             ]
         )
         if platform.system() == "Windows":
@@ -1019,8 +1022,9 @@ class MusicPlayer:
             "--no-warnings",
             "--no-playlist",
             "--skip-download",
+            # Prefer AAC/m4a (140) over webm/opus (251): VLC on Pi often stutters on opus DASH.
             "-f",
-            "bestaudio/best",
+            "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
             "-g",
             youtube_url,
         ]
