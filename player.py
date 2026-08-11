@@ -82,16 +82,16 @@ class MusicPlayer:
             "--no-xlib",
             "--quiet",
         ]
-        # Prefer larger network cache: YouTube DASH (esp. webm/opus) underruns easily on Pi.
+        # Large network cache: YouTube DASH underruns easily on Pi at track start.
         vlc_options.extend(
             [
-                "--file-caching=8000",
-                "--network-caching=30000",
-                "--live-caching=8000",
+                "--file-caching=10000",
+                "--network-caching=60000",
+                "--live-caching=10000",
                 "--clock-jitter=0",
                 "--clock-synchro=0",
                 "--http-reconnect",
-                "--sout-mux-caching=8000",
+                "--sout-mux-caching=10000",
             ]
         )
         if platform.system() == "Windows":
@@ -397,18 +397,85 @@ class MusicPlayer:
             return
 
         media = self.instance.media_new(media_url)
+        # Media-level options stick more reliably than instance flags for HTTP/DASH.
+        for opt in (
+            ":network-caching=60000",
+            ":file-caching=10000",
+            ":live-caching=10000",
+            ":http-reconnect",
+            ":no-video",
+        ):
+            try:
+                media.add_option(opt)
+            except Exception:
+                pass
+
+        # Mute while VLC fills the network buffer — otherwise the first few seconds
+        # stutter in ~250–500ms bursts (classic YouTube DASH underrun on Pi).
+        target_vol = int(self.volume)
+        try:
+            self.player.audio_set_volume(0)
+        except Exception:
+            pass
         self.player.set_media(media)
         self.player.play()
-        await asyncio.sleep(0.3)
+
+        warmed = await self._wait_for_playback_buffer(timeout_s=12.0)
+        try:
+            self.player.audio_set_volume(target_vol)
+        except Exception:
+            pass
+
         self.current_track_id = track.get("id")
         self.current_track = track
         self._expect_playing = True
         self._stall_since = None
         self._play_started_at = time.monotonic()
         self._last_known_position_s = 0.0
-        logger.info("Playing track %s", self.current_track_id)
+        if warmed:
+            logger.info("Playing track %s (buffer ready)", self.current_track_id)
+        else:
+            logger.warning(
+                "Playing track %s (buffer warmup timed out — may stutter briefly)",
+                self.current_track_id,
+            )
         # Resolve the *next* track in the background so song transitions are near-instant.
         self._schedule_prefetch_next()
+
+    async def _wait_for_playback_buffer(self, timeout_s: float = 12.0) -> bool:
+        """Wait until VLC leaves Buffering and stays in Playing long enough to fill cache."""
+        if not self.player or not vlc:
+            await asyncio.sleep(0.5)
+            return False
+        deadline = time.monotonic() + timeout_s
+        stable_since: Optional[float] = None
+        saw_playing = False
+        while time.monotonic() < deadline:
+            try:
+                state = self.player.get_state()
+            except Exception:
+                await asyncio.sleep(0.2)
+                continue
+            if state in (vlc.State.Error, vlc.State.Ended, vlc.State.Stopped):
+                return False
+            if state in (vlc.State.Opening, vlc.State.Buffering):
+                stable_since = None
+            elif state == vlc.State.Playing:
+                saw_playing = True
+                # Prefer a bit of decoded audio in the pipe (pos>0) + stable Playing.
+                try:
+                    pos_ms = int(self.player.get_time() or 0)
+                except Exception:
+                    pos_ms = 0
+                if pos_ms >= 400:
+                    if stable_since is None:
+                        stable_since = time.monotonic()
+                    elif time.monotonic() - stable_since >= 1.2:
+                        return True
+                else:
+                    stable_since = None
+            await asyncio.sleep(0.15)
+        return saw_playing
 
     def _cache_key(self, track: Dict[str, Any]) -> str:
         return str(track.get("id") or track.get("source_id") or track.get("source_url") or "")
@@ -454,8 +521,8 @@ class MusicPlayer:
 
     async def _prefetch_next_track(self) -> None:
         try:
-            # Let the current track stabilize / CPU cool down after start.
-            await asyncio.sleep(3.0)
+            # Let current track finish silent buffer warmup before competing for CPU/net.
+            await asyncio.sleep(5.0)
             if not self.current_playlist or self._ad_playing:
                 return
             nxt = self._next_track_index()
