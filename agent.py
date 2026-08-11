@@ -354,8 +354,10 @@ class Agent:
         self._ws_status_ticks = 0
         self._command_queue: "asyncio.Queue[dict]" = asyncio.Queue()
         self._control_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+        self._ad_queue: "asyncio.Queue[dict]" = asyncio.Queue()
         self._command_worker_task: Optional[asyncio.Task] = None
         self._control_worker_task: Optional[asyncio.Task] = None
+        self._ad_worker_task: Optional[asyncio.Task] = None
         self._last_command_tick: float = 0.0
 
     async def start(self) -> None:
@@ -368,6 +370,7 @@ class Agent:
 
         self._command_worker_task = asyncio.create_task(self._command_worker())
         self._control_worker_task = asyncio.create_task(self._control_worker())
+        self._ad_worker_task = asyncio.create_task(self._ad_worker())
         asyncio.create_task(self._watchdog_loop())
 
         # Always keep a light HTTP heartbeat as last_seen backup. WS status_update is
@@ -390,15 +393,24 @@ class Agent:
                 self._command_worker_task.cancel()
             if self._control_worker_task:
                 self._control_worker_task.cancel()
+            if self._ad_worker_task:
+                self._ad_worker_task.cancel()
 
     def _is_priority_control(self, command: dict) -> bool:
         command_type = command.get("type")
         action = (command.get("action") or "").lower()
         if command_type == "volume_control":
             return True
-        if command_type == "playback_control" and action in {"pause", "stop"}:
+        if command_type == "playback_control" and action in {
+            "pause",
+            "stop",
+            "set_repeat_mode",
+        }:
             return True
         return False
+
+    def _is_ad_command(self, command: dict) -> bool:
+        return command.get("type") == "ad_control"
 
     async def _control_worker(self) -> None:
         """Fast path for volume/pause/stop — never blocked behind yt-dlp/play."""
@@ -426,6 +438,33 @@ class Agent:
                 logger.error("Control worker outer error: %s", exc)
                 await asyncio.sleep(0.5)
         logger.info("Control worker stopped")
+
+    async def _ad_worker(self) -> None:
+        """Dedicated worker for ads — never blocks music play/next."""
+        logger.info("Ad worker started")
+        while self.running:
+            try:
+                command = await self._ad_queue.get()
+                self._last_command_tick = time.time()
+                try:
+                    logger.info(
+                        "Handling ad command: action=%s campaign=%s",
+                        command.get("action"),
+                        command.get("campaign_id"),
+                    )
+                    await asyncio.wait_for(self._handle_command(command), timeout=25.0)
+                except asyncio.TimeoutError:
+                    logger.error("Ad command timed out: %s", command.get("campaign_id"))
+                except Exception as exc:
+                    logger.error("Ad worker error: %s", exc)
+                finally:
+                    self._ad_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Ad worker outer error: %s", exc)
+                await asyncio.sleep(0.5)
+        logger.info("Ad worker stopped")
 
     async def _command_worker(self) -> None:
         """Process queued commands sequentially, each with its own timeout, so a
@@ -487,6 +526,7 @@ class Agent:
                 recovered = await self.player.recover_if_stalled(stall_seconds=8.0)
                 if recovered:
                     logger.info("Watchdog recovered stalled playback")
+                await self.player.ensure_next_prefetched()
             except Exception as exc:
                 logger.warning("Playback stall watchdog failed: %s", exc)
 
@@ -504,21 +544,27 @@ class Agent:
 
         control_n = 0
         heavy_n = 0
+        ad_n = 0
         for command in filtered:
-            if self._is_priority_control(command):
+            if self._is_ad_command(command):
+                await self._ad_queue.put(command)
+                ad_n += 1
+            elif self._is_priority_control(command):
                 await self._control_queue.put(command)
                 control_n += 1
             else:
                 await self._command_queue.put(command)
                 heavy_n += 1
-        if control_n or heavy_n:
+        if control_n or heavy_n or ad_n:
             logger.info(
-                "Queued %s control + %s heavy command(s) from %s (control_q=%s heavy_q=%s)",
+                "Queued %s control + %s heavy + %s ad command(s) from %s (control_q=%s heavy_q=%s ad_q=%s)",
                 control_n,
                 heavy_n,
+                ad_n,
                 source,
                 self._control_queue.qsize(),
                 self._command_queue.qsize(),
+                self._ad_queue.qsize(),
             )
 
     async def _start_websocket_with_retries(self) -> None:
@@ -701,6 +747,11 @@ class Agent:
             position = command.get("position") or command.get("seek_position")
             if position is not None:
                 await self.player.seek(position)
+        elif action == "set_repeat_mode":
+            mode = command.get("repeat_mode") or command.get("mode")
+            if mode:
+                self.player.repeat_mode = str(mode)
+                logger.info("Repeat mode set to %s", self.player.repeat_mode)
 
     async def _handle_volume_control(self, command: dict) -> None:
         volume = command.get("volume")

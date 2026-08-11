@@ -58,6 +58,12 @@ class MusicPlayer:
         self._ad_schedule_config: dict = {}
         self._expect_playing = False
         self._stall_since: Optional[float] = None
+        # track_id -> (media_url, expires_at_monotonic)
+        self._url_cache: Dict[str, tuple] = {}
+        self._prefetch_task: Optional[asyncio.Task] = None
+        self._url_cache_ttl_s = 45 * 60
+        self._play_started_at: float = 0.0
+        self._last_known_position_s: float = 0.0
 
         self._init_vlc()
 
@@ -174,21 +180,51 @@ class MusicPlayer:
         except Exception:
             state = None
 
-        # Idempotent play: don't re-resolve YouTube if already on this track.
         same_track = (
             target_id is not None
             and self.current_track_id is not None
             and str(target_id) == str(self.current_track_id)
         )
-        if same_track and vlc and state == vlc.State.Playing:
-            logger.info("Already playing track %s — ignoring duplicate play", target_id)
+        active_states = set()
+        if vlc:
+            active_states = {
+                vlc.State.Playing,
+                vlc.State.Buffering,
+                vlc.State.Opening,
+            }
+
+        # CRITICAL: dashboard often re-sends play while VLC is still Buffering/Opening
+        # after a YouTube start. Re-calling play() restarts the track from 0 in a loop.
+        if same_track and state in active_states:
+            logger.info(
+                "Already active on track %s (state=%s) — ignoring duplicate play",
+                target_id,
+                getattr(state, "name", state),
+            )
             self._expect_playing = True
             return
+
         if same_track and vlc and state == vlc.State.Paused:
             logger.info("Resuming paused track %s", target_id)
             self.player.set_pause(False)
             self._expect_playing = True
             self._stall_since = None
+            return
+
+        # Grace window: even if state flickers to Stopped for a moment, don't restart.
+        if (
+            same_track
+            and self._expect_playing
+            and self._play_started_at
+            and (time.monotonic() - self._play_started_at) < 20.0
+            and state not in ({vlc.State.Ended, vlc.State.Error} if vlc else set())
+        ):
+            logger.info(
+                "Track %s started %.1fs ago — ignoring duplicate play (state=%s)",
+                target_id,
+                time.monotonic() - self._play_started_at,
+                getattr(state, "name", state),
+            )
             return
 
         self._expect_playing = True
@@ -273,6 +309,12 @@ class MusicPlayer:
             is_playing = False
             if self._ad_saved_position_ms is not None and self._ad_saved_position_ms >= 0:
                 position_sec = self._ad_saved_position_ms / 1000.0
+        # YouTube/VLC often reports time=0 while Buffering; don't tell the dashboard
+        # we jumped back to the start (that triggers another play command).
+        if is_playing and position_sec <= 0.25 and self._last_known_position_s > 1.0:
+            position_sec = self._last_known_position_s
+        elif position_sec > 0.25:
+            self._last_known_position_s = position_sec
         length_sec = max(self.player.get_length() / 1000.0, 0.0)
         track_position = None
         if self.current_playlist:
@@ -336,7 +378,15 @@ class MusicPlayer:
             return
 
         track = self.current_playlist[self.current_index]
-        media_url = await self._get_media_url(track)
+        cached = self._get_cached_url(track)
+        if cached:
+            logger.info("Using prefetched URL for track %s", track.get("id"))
+            media_url = cached
+        else:
+            media_url = await self._get_media_url(track, use_cache=False)
+            if media_url:
+                self._put_cached_url(track, media_url)
+
         if not media_url:
             logger.warning("No playable URL, skipping track %s", track.get("id"))
             self.current_index = (self.current_index + 1) % len(self.current_playlist)
@@ -351,7 +401,102 @@ class MusicPlayer:
         self.current_track = track
         self._expect_playing = True
         self._stall_since = None
+        self._play_started_at = time.monotonic()
+        self._last_known_position_s = 0.0
         logger.info("Playing track %s", self.current_track_id)
+        # Resolve the *next* track in the background so song transitions are near-instant.
+        self._schedule_prefetch_next()
+
+    def _cache_key(self, track: Dict[str, Any]) -> str:
+        return str(track.get("id") or track.get("source_id") or track.get("source_url") or "")
+
+    def _get_cached_url(self, track: Dict[str, Any]) -> Optional[str]:
+        key = self._cache_key(track)
+        if not key:
+            return None
+        entry = self._url_cache.get(key)
+        if not entry:
+            return None
+        url, expires_at = entry
+        if time.monotonic() >= expires_at:
+            self._url_cache.pop(key, None)
+            return None
+        return url
+
+    def _put_cached_url(self, track: Dict[str, Any], url: str) -> None:
+        key = self._cache_key(track)
+        if key and url:
+            self._url_cache[key] = (url, time.monotonic() + self._url_cache_ttl_s)
+
+    def _next_track_index(self) -> Optional[int]:
+        if not self.current_playlist:
+            return None
+        if self.repeat_mode == "repeat_one":
+            return self.current_index
+        if self.repeat_mode == "play_once":
+            nxt = self.current_index + 1
+            if nxt >= len(self.current_playlist):
+                return None
+            return nxt
+        return (self.current_index + 1) % len(self.current_playlist)
+
+    def _schedule_prefetch_next(self) -> None:
+        if self._prefetch_task and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._prefetch_task = loop.create_task(self._prefetch_next_track())
+
+    async def _prefetch_next_track(self) -> None:
+        try:
+            # Let the current track stabilize / CPU cool down after start.
+            await asyncio.sleep(3.0)
+            if not self.current_playlist or self._ad_playing:
+                return
+            nxt = self._next_track_index()
+            if nxt is None:
+                return
+            track = self.current_playlist[nxt]
+            if self._get_cached_url(track):
+                logger.info("Next track %s already prefetched", track.get("id"))
+                return
+            logger.info("Prefetching next track %s", track.get("id"))
+            url = await self._get_media_url(track, use_cache=False)
+            if url:
+                self._put_cached_url(track, url)
+                logger.info("Prefetched next track %s", track.get("id"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Prefetch failed: %s", exc)
+
+    async def ensure_next_prefetched(self) -> None:
+        """Call periodically near end-of-track to make sure next URL is ready."""
+        if not self.player or not self._expect_playing or self._ad_playing:
+            return
+        if not self.current_playlist:
+            return
+        try:
+            length_ms = self.player.get_length()
+            pos_ms = self.player.get_time()
+        except Exception:
+            return
+        if length_ms <= 0 or pos_ms < 0:
+            return
+        # When 70% of the track has played, make sure next URL is cached.
+        if pos_ms < length_ms * 0.70:
+            return
+        nxt = self._next_track_index()
+        if nxt is None:
+            return
+        track = self.current_playlist[nxt]
+        if self._get_cached_url(track):
+            return
+        if self._prefetch_task and not self._prefetch_task.done():
+            return
+        self._schedule_prefetch_next()
 
     async def recover_if_stalled(self, stall_seconds: float = 20.0) -> bool:
         """If we expect music but VLC is Ended/Error for long enough, advance."""
@@ -419,6 +564,7 @@ class MusicPlayer:
             except Exception:
                 duration_played = 0.0
 
+        # Don't block the next track on analytics — log in the background.
         if self.on_track_ended and ended_track_id is not None:
             try:
                 result = self.on_track_ended(
@@ -427,7 +573,7 @@ class MusicPlayer:
                     duration_played,
                 )
                 if asyncio.iscoroutine(result):
-                    await result
+                    asyncio.create_task(result)
             except Exception as exc:
                 logger.warning("on_track_ended callback failed: %s", exc)
 
@@ -811,7 +957,12 @@ class MusicPlayer:
         self._ad_pre_music_volume = None
         self._ad_saved_position_ms = None
 
-    async def _get_media_url(self, track: Dict[str, Any]) -> Optional[str]:
+    async def _get_media_url(self, track: Dict[str, Any], *, use_cache: bool = True) -> Optional[str]:
+        if use_cache:
+            cached = self._get_cached_url(track)
+            if cached:
+                return cached
+
         source = track.get("source")
         source_url = track.get("source_url")
         source_id = track.get("source_id")
@@ -830,7 +981,10 @@ class MusicPlayer:
             youtube_url = source_url or (f"https://www.youtube.com/watch?v={source_id}" if source_id else None)
             if not youtube_url:
                 return None
-            return await self._get_youtube_stream_url(str(youtube_url))
+            resolved = await self._get_youtube_stream_url(str(youtube_url))
+            if resolved:
+                self._put_cached_url(track, resolved)
+            return resolved
 
         if source_url:
             return self._absolutize_url(str(source_url))
