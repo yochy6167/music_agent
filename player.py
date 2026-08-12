@@ -30,6 +30,8 @@ class MusicPlayer:
     PREFETCH_AT_FRACTION = 0.60
     # Cap for the above, so tracks of unknown length still get prefetched.
     PREFETCH_MAX_WAIT_S = 150.0
+    # Silence held after a seek while VLC refetches and refills its buffer.
+    SEEK_REBUFFER_S = 1.5
 
     def __init__(self, api_url: str, device_token: str) -> None:
         self.api_url = api_url.rstrip("/")
@@ -338,16 +340,46 @@ class MusicPlayer:
         if length_ms and length_ms > 0:
             target_ms = min(target_ms, max(length_ms - 1000, 0))
 
+        # A seek makes VLC re-request the HTTP range, but it keeps feeding the
+        # audio output while the buffer is starved. Measured at the speaker, a
+        # backward seek produced ~1.7s of ~150ms gaps — audible as machine-gun
+        # stuttering. Pausing across the refill lets the buffer fill in silence
+        # and turns that into one short, clean gap.
+        resume_volume: Optional[int] = None
+        bridged = self._expect_playing and not self._ad_playing
+        if bridged:
+            try:
+                current = self.player.audio_get_volume()
+                if current is not None and current > 0:
+                    resume_volume = int(current)
+                    self.player.audio_set_volume(0)
+                self.player.set_pause(True)
+            except Exception:
+                bridged = False
+
         self.player.set_time(target_ms)
 
-        # Without this the dashboard keeps reporting the pre-seek position: the
-        # status clamp below treats the post-seek 0 as a buffering artefact, and
-        # the stall watchdog sees the jump as "position stopped advancing".
+        # Set before the wait so a status read during it reports the target, not
+        # the pre-seek position: the clamp in get_status() would otherwise treat
+        # the post-seek 0 as a buffering artefact, and the stall watchdog would
+        # read the jump as "position stopped advancing".
         self._seeked_at = time.monotonic()
         self._last_known_position_s = target_ms / 1000.0
         self._progress_position_ms = -1
         self._progress_changed_at = time.monotonic()
         self._stall_since = None
+
+        if bridged:
+            await asyncio.sleep(self.SEEK_REBUFFER_S)
+            try:
+                self.player.set_pause(False)
+                if resume_volume is not None:
+                    self.player.audio_set_volume(resume_volume)
+            except Exception:
+                pass
+            self._seeked_at = time.monotonic()
+            self._progress_changed_at = time.monotonic()
+
         logger.info("Seek to %.1fs", target_ms / 1000.0)
 
     async def get_status(self) -> Dict[str, Any]:
