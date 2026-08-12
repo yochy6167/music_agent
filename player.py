@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import platform
 import time
 from pathlib import Path
@@ -17,6 +18,14 @@ except Exception:  # pragma: no cover - runtime dependency
 
 class MusicPlayer:
     CACHE_EXT = ".mp3"
+    # A track whose position has not moved for this long is treated as dead and restarted.
+    FROZEN_TIMEOUT_S = 12.0
+    # Time after a start during which a non-advancing position is still normal (buffer fill).
+    FROZEN_GRACE_S = 15.0
+    # Restarts of the same track before giving up on it and advancing.
+    FROZEN_MAX_RESTARTS = 2
+    RESOLVE_BACKOFF_BASE_S = 120.0
+    RESOLVE_BACKOFF_MAX_S = 3600.0
 
     def __init__(self, api_url: str, device_token: str) -> None:
         self.api_url = api_url.rstrip("/")
@@ -60,10 +69,17 @@ class MusicPlayer:
         self._stall_since: Optional[float] = None
         # track_id -> (media_url, expires_at_monotonic)
         self._url_cache: Dict[str, tuple] = {}
+        # track_id -> (failure_count, retry_not_before_monotonic)
+        self._failed_urls: Dict[str, tuple] = {}
         self._prefetch_task: Optional[asyncio.Task] = None
         self._url_cache_ttl_s = 45 * 60
         self._play_started_at: float = 0.0
         self._last_known_position_s: float = 0.0
+        self._play_lock = asyncio.Lock()
+        self._progress_position_ms: int = -1
+        self._progress_changed_at: float = time.monotonic()
+        self._frozen_track_id: Optional[Any] = None
+        self._frozen_restarts: int = 0
 
         self._init_vlc()
 
@@ -82,22 +98,33 @@ class MusicPlayer:
             "--no-xlib",
             "--quiet",
         ]
-        # Large network cache: YouTube DASH underruns easily on Pi at track start.
+        # network-caching is the PTS delay: how far ahead VLC schedules the first
+        # sample. The previous 60000 meant a 60s delay before the track was considered
+        # started, which delays recovery and inflates memory for no benefit — 5s is
+        # ample for background music. clock-jitter/clock-synchro are deliberately left
+        # at their defaults; pinning them to 0 removes all drift tolerance, so ordinary
+        # HTTP arrival jitter gets treated as a stream discontinuity.
         vlc_options.extend(
             [
-                "--file-caching=10000",
-                "--network-caching=60000",
-                "--live-caching=10000",
-                "--clock-jitter=0",
-                "--clock-synchro=0",
+                "--file-caching=3000",
+                "--network-caching=5000",
                 "--http-reconnect",
-                "--sout-mux-caching=10000",
             ]
         )
         if platform.system() == "Windows":
             vlc_options.append("--aout=adp")
         elif platform.system() == "Linux":
-            vlc_options.append("--aout=pulse")
+            # VLC's native PulseAudio output glitches badly on the Pi: measured over
+            # 45s of the same track it produced repeated "cannot synchronize start",
+            # buffer underruns and dropped buffers, heard as audio cutting in and out.
+            # Its ALSA output was clean in the same test. ALSA "default" still reaches
+            # PulseAudio through the alsa-pulse plugin, so pactl volume control, the
+            # ad/music mixing and HDMI-vs-jack selection all keep working — only the
+            # faulty output module is bypassed.
+            vlc_options.append("--aout=alsa")
+            alsa_device = os.environ.get("ALSA_AUDIO_DEVICE", "default").strip()
+            if alsa_device:
+                vlc_options.append(f"--alsa-audio-device={alsa_device}")
         try:
             self.instance = vlc.Instance(vlc_options)
             self.player = self.instance.media_player_new()
@@ -212,6 +239,9 @@ class MusicPlayer:
             self.player.set_pause(False)
             self._expect_playing = True
             self._stall_since = None
+            self._progress_position_ms = -1
+            self._progress_changed_at = time.monotonic()
+            self._play_started_at = time.monotonic()
             return
 
         # Grace window: even if state flickers to Stopped for a moment, don't restart.
@@ -370,6 +400,17 @@ class MusicPlayer:
         logger.warning("Track %s not found in playlist", track_id)
 
     async def _play_current_track(self, *, _skip_depth: int = 0) -> None:
+        """Serialised entry point for starting a track.
+
+        Auto-advance runs from the VLC end-of-track event while dashboard commands
+        run on the command worker, so two callers can reach this concurrently. Two
+        overlapping set_media()/play() calls on one media player leave VLC wedged,
+        so the whole start sequence is guarded by a lock.
+        """
+        async with self._play_lock:
+            await self._play_current_track_locked(_skip_depth=_skip_depth)
+
+    async def _play_current_track_locked(self, *, _skip_depth: int = 0) -> None:
         if not self.current_playlist or not self.player:
             return
         if _skip_depth >= min(len(self.current_playlist), 12):
@@ -389,19 +430,20 @@ class MusicPlayer:
             media_url = await self._get_media_url(track, use_cache=False)
             if media_url:
                 self._put_cached_url(track, media_url)
+            else:
+                self._mark_resolve_failed(track)
 
         if not media_url:
             logger.warning("No playable URL, skipping track %s", track.get("id"))
             self.current_index = (self.current_index + 1) % len(self.current_playlist)
-            await self._play_current_track(_skip_depth=_skip_depth + 1)
+            await self._play_current_track_locked(_skip_depth=_skip_depth + 1)
             return
 
         media = self.instance.media_new(media_url)
         # Media-level options stick more reliably than instance flags for HTTP/DASH.
         for opt in (
-            ":network-caching=60000",
-            ":file-caching=10000",
-            ":live-caching=10000",
+            ":network-caching=5000",
+            ":file-caching=3000",
             ":http-reconnect",
             ":no-video",
         ):
@@ -410,28 +452,42 @@ class MusicPlayer:
             except Exception:
                 pass
 
-        # Mute while VLC fills the network buffer — otherwise the first few seconds
-        # stutter in ~250–500ms bursts (classic YouTube DASH underrun on Pi).
+        # Mute while VLC fills the network buffer, so a rough start is inaudible.
         target_vol = int(self.volume)
         try:
             self.player.audio_set_volume(0)
         except Exception:
             pass
-        self.player.set_media(media)
-        self.player.play()
 
-        warmed = await self._wait_for_playback_buffer(timeout_s=12.0)
-        try:
-            self.player.audio_set_volume(target_vol)
-        except Exception:
-            pass
-
+        # Claim the track *before* awaiting the warmup: until these are set, a
+        # concurrent play() for the same track sees a stale current_track_id and
+        # cannot recognise it as a duplicate.
         self.current_track_id = track.get("id")
         self.current_track = track
         self._expect_playing = True
         self._stall_since = None
         self._play_started_at = time.monotonic()
         self._last_known_position_s = 0.0
+        self._progress_position_ms = -1
+        self._progress_changed_at = time.monotonic()
+
+        self.player.set_media(media)
+        # libvlc keeps its own reference once the media is attached to the player;
+        # dropping ours here avoids leaking one media object per track.
+        try:
+            media.release()
+        except Exception:
+            pass
+        self.player.play()
+
+        warmed = await self._wait_for_playback_buffer(timeout_s=8.0)
+        try:
+            self.player.audio_set_volume(target_vol)
+        except Exception:
+            pass
+
+        self._play_started_at = time.monotonic()
+        self._progress_changed_at = time.monotonic()
         if warmed:
             logger.info("Playing track %s (buffer ready)", self.current_track_id)
         else:
@@ -497,6 +553,44 @@ class MusicPlayer:
         key = self._cache_key(track)
         if key and url:
             self._url_cache[key] = (url, time.monotonic() + self._url_cache_ttl_s)
+            self._failed_urls.pop(key, None)
+
+    def _invalidate_cached_url(self, track: Dict[str, Any]) -> None:
+        key = self._cache_key(track)
+        if key:
+            self._url_cache.pop(key, None)
+
+    def _mark_resolve_failed(self, track: Dict[str, Any]) -> None:
+        """Back off on tracks whose URL cannot be resolved.
+
+        Without this, a permanently unavailable video (deleted, region-locked) makes
+        ensure_next_prefetched() spawn a fresh yt-dlp process on every watchdog tick.
+        Each spawn is a whole Python interpreter, which is heavy enough on a Pi to
+        disturb the audio output of the track currently playing.
+        """
+        key = self._cache_key(track)
+        if not key:
+            return
+        failures = self._failed_urls.get(key, (0, 0.0))[0] + 1
+        backoff = min(self.RESOLVE_BACKOFF_BASE_S * (2 ** (failures - 1)), self.RESOLVE_BACKOFF_MAX_S)
+        self._failed_urls[key] = (failures, time.monotonic() + backoff)
+        logger.warning(
+            "Track %s failed to resolve (attempt %s) — not retrying for %.0fs",
+            track.get("id"),
+            failures,
+            backoff,
+        )
+
+    def _resolve_backoff_active(self, track: Dict[str, Any]) -> bool:
+        key = self._cache_key(track)
+        if not key:
+            return False
+        entry = self._failed_urls.get(key)
+        if not entry:
+            return False
+        if time.monotonic() >= entry[1]:
+            return False
+        return True
 
     def _next_track_index(self) -> Optional[int]:
         if not self.current_playlist:
@@ -532,11 +626,15 @@ class MusicPlayer:
             if self._get_cached_url(track):
                 logger.info("Next track %s already prefetched", track.get("id"))
                 return
+            if self._resolve_backoff_active(track):
+                return
             logger.info("Prefetching next track %s", track.get("id"))
             url = await self._get_media_url(track, use_cache=False)
             if url:
                 self._put_cached_url(track, url)
                 logger.info("Prefetched next track %s", track.get("id"))
+            else:
+                self._mark_resolve_failed(track)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -564,16 +662,33 @@ class MusicPlayer:
         track = self.current_playlist[nxt]
         if self._get_cached_url(track):
             return
+        if self._resolve_backoff_active(track):
+            return
         if self._prefetch_task and not self._prefetch_task.done():
             return
         self._schedule_prefetch_next()
 
     async def recover_if_stalled(self, stall_seconds: float = 20.0) -> bool:
-        """If we expect music but VLC is Ended/Error for long enough, advance."""
+        """Recover playback that has died without VLC reporting Ended/Error.
+
+        Two distinct failure modes are handled:
+
+        1. VLC reports Ended/Error while we still expect audio -> advance.
+        2. VLC still reports Playing/Buffering but the playback position stops
+           moving. This is what happens when the HTTP source dies mid-track: the
+           input socket is gone, libvlc never transitions out of Playing, and the
+           device stays silent indefinitely while still reporting "playing" to the
+           dashboard. Only a position check can see it.
+        """
         if not self.player or not self._expect_playing or self._ad_playing:
             self._stall_since = None
+            self._progress_changed_at = time.monotonic()
             return False
         if not self.current_playlist:
+            return False
+        # A start is already in flight; let it finish before judging progress.
+        if self._play_lock.locked():
+            self._progress_changed_at = time.monotonic()
             return False
 
         try:
@@ -582,24 +697,85 @@ class MusicPlayer:
             return False
 
         stalled_states = {vlc.State.Ended, vlc.State.Error} if vlc else set()
-        if state not in stalled_states:
+        if state in stalled_states:
+            now = time.time()
+            if self._stall_since is None:
+                self._stall_since = now
+                return False
+            if now - self._stall_since < stall_seconds:
+                return False
+            logger.warning(
+                "Playback stalled (vlc_state=%s) for %.0fs — advancing to next track",
+                getattr(state, "name", state),
+                now - self._stall_since,
+            )
             self._stall_since = None
-            return False
+            await self.next()
+            return True
 
-        now = time.time()
-        if self._stall_since is None:
-            self._stall_since = now
-            return False
-        if now - self._stall_since < stall_seconds:
-            return False
-
-        logger.warning(
-            "Playback stalled (vlc_state=%s) for %.0fs — advancing to next track",
-            getattr(state, "name", state),
-            now - self._stall_since,
-        )
         self._stall_since = None
-        await self.next()
+        return await self._recover_if_position_frozen(state)
+
+    async def _recover_if_position_frozen(self, state: Any) -> bool:
+        """Restart the current track if its position has stopped advancing."""
+        # Don't fight the initial buffer fill — a fresh start legitimately sits at 0.
+        if self._play_started_at and (time.monotonic() - self._play_started_at) < self.FROZEN_GRACE_S:
+            return False
+        try:
+            pos_ms = int(self.player.get_time() or 0)
+        except Exception:
+            return False
+
+        now = time.monotonic()
+        # Treat anything beyond a poll-jitter allowance as real forward progress.
+        if pos_ms < 0 or abs(pos_ms - self._progress_position_ms) > 250:
+            self._progress_position_ms = pos_ms
+            self._progress_changed_at = now
+            # Healthy playback clears the give-up counter so an isolated freeze later
+            # in the same track still gets its full quota of retries.
+            if self._frozen_track_id is not None and pos_ms > 0:
+                self._frozen_track_id = None
+                self._frozen_restarts = 0
+            return False
+
+        frozen_for = now - self._progress_changed_at
+        if frozen_for < self.FROZEN_TIMEOUT_S:
+            return False
+
+        self._progress_changed_at = now
+        self._progress_position_ms = -1
+        if self.current_index >= len(self.current_playlist):
+            self.current_index = 0
+
+        if self._frozen_track_id != self.current_track_id:
+            self._frozen_track_id = self.current_track_id
+            self._frozen_restarts = 0
+        self._frozen_restarts += 1
+
+        # Retrying the same track forever would leave the branch silent, so give up
+        # on it after a couple of attempts and move on to the next one.
+        give_up = self._frozen_restarts > self.FROZEN_MAX_RESTARTS
+        logger.error(
+            "Playback frozen at %.1fs for %.0fs (vlc_state=%s) on track %s — %s",
+            pos_ms / 1000.0,
+            frozen_for,
+            getattr(state, "name", state),
+            self.current_track_id,
+            "skipping to next track" if give_up else f"restart attempt {self._frozen_restarts}",
+        )
+        # The cached stream URL is the most likely culprit, so force a fresh resolve.
+        self._invalidate_cached_url(self.current_playlist[self.current_index])
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+        if give_up:
+            self._frozen_track_id = None
+            self._frozen_restarts = 0
+            await self.next()
+        else:
+            await self._play_current_track()
         return True
 
     def _on_track_end(self, event: Any) -> None:

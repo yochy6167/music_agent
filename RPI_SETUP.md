@@ -159,6 +159,15 @@ pactl get-sink-volume @DEFAULT_SINK@
 amixer -c 0 sget 'PCM'
 ```
 
+**מודול פלט האודיו:** הסוכן מנגן דרך `--aout=alsa` עם device `default` ולא דרך מודול
+ה-PulseAudio של VLC, כי המודול הזה מייצר קטיעות על ה-Pi (ראה "אבחון קטיעות בנגינה").
+`default` של ALSA עדיין מגיע ל-PulseAudio דרך תוסף `alsa-pulse`, כך שבקרת העוצמה ב-`pactl`,
+המיקס של פרסומת מעל מוזיקה ובחירת HDMI/אוזניות ממשיכים לעבוד — רק מודול הפלט הבעייתי נעקף.
+
+אם צריך לכפות התקן אחר: `sudo systemctl edit music_agent` →
+`Environment=ALSA_AUDIO_DEVICE=plughw:CARD=vc4hdmi0,DEV=0`
+(שים לב: התקן `plughw` עוקף את PulseAudio לגמרי, ואז אין מיקס לפרסומות ואין בקרת `pactl`).
+
 **שתי שכבות עוצמה:** מערכת (`pactl`) + נגן VLC (מהדשבורד, ברירת מחדל 50%). אם 50% בדשבורד נשמע חלש — העלה בדשבורד ל-80–100%.
 
 ### HDMI למגבר בסניף (בלי פקודות ידניות)
@@ -263,6 +272,40 @@ ssh pi@music-agent-01
 | אין סידורי Pi בלוג | `cat /proc/cpuinfo \| grep Serial` — אם `00000000`, עדכן EEPROM/firmware |
 | VLC / נגינה | `sudo apt install vlc libvlc-dev` ואז `bash setup.sh` שוב |
 | Tailscale לא מתחבר / IP לא עונה | `sudo tailscale status` על ה-Pi; ודא שהמכשיר לא "Expired" בפאנל הניהול (כבה Key Expiry) |
+| מוזיקה נקטעת כל חצי שנייה / נתקעת | ראה "אבחון קטיעות בנגינה" למטה |
+
+### אבחון קטיעות בנגינה
+
+הסימפטום "המוזיקה נתקעת כל חצי שנייה ואז ממשיכה, ובשיר הבא נתקעת ולא משתחררת" נגרם
+ממודול הפלט **PulseAudio של VLC**. השוואה מדודה על ה-Pi, 45 שניות מאותו שיר בכל הרצה:
+
+| מודול פלט | `cannot synchronize start` | underruns | באפרים שנזרקו |
+|-----------|---------------------------|-----------|----------------|
+| `--aout=pulse` | 25–29 | 15–16 | 25–27 |
+| `--aout=pulse` עם באפר 1000ms | 87 | 44 | 55 |
+| `--aout=alsa` (device `default`) | 0 | 0 | 0 |
+
+הגדלת הבאפר של PulseAudio רק החמירה, ולכן היא **לא** הפתרון. הפתרון הוא `--aout=alsa`.
+
+לשחזור האבחון:
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/1000
+cd ~/music_agent
+
+URL=$(.venv/bin/python -m yt_dlp -q --no-warnings --skip-download \
+  -f '140/bestaudio' -g 'https://www.youtube.com/watch?v=VIDEO_ID' | head -1)
+
+# ספירת תקלות אודיו של ליבת VLC (עובד לכל מודול פלט)
+cvlc -vv --intf dummy --no-video --aout=alsa --alsa-audio-device=default "$URL" 2>&1 \
+  | grep -ciE 'playback too late|dropping buffer|underrun'
+
+# האם PulseAudio עדיין בנתיב? (1 = כן, דרך תוסף alsa-pulse — זה הצפוי והתקין)
+pactl list sink-inputs | grep -c 'Sink Input'
+```
+
+בנוסף, `recover_if_stalled` ב-`player.py` בודק שהמיקום בשיר מתקדם: אם ה-HTTP source מת
+באמצע שיר, VLC נשאר במצב `Playing` לנצח ולכן בדיקת state לבדה לא מזהה את התקיעה.
 
 ---
 

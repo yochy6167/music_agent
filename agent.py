@@ -510,7 +510,9 @@ class Agent:
     async def _watchdog_loop(self) -> None:
         """Detect stalled command queue / stalled playback and recover."""
         while self.running:
-            await asyncio.sleep(10.0)
+            # Polling is only a couple of libvlc getters, so run it often enough that
+            # a frozen track is caught within a few seconds rather than half a minute.
+            await asyncio.sleep(5.0)
             now = time.time()
             if self._command_queue.qsize() > 0 and self._last_command_tick and now - self._last_command_tick > 40:
                 logger.warning(
@@ -966,7 +968,16 @@ class Agent:
                 # Backup last_seen for the dashboard when WS is quiet/wedged.
                 await asyncio.sleep(30)
                 status = await self.player.get_status()
-                await self.client.send_heartbeat(self._build_heartbeat(status))
+                response = await self.client.send_heartbeat(self._build_heartbeat(status))
+                # The heartbeat endpoint drains the server-side pending queue, so
+                # anything it returns has already been removed there. Ignoring the
+                # response silently loses commands queued while the WS was down.
+                if response:
+                    if response.get("repeat_mode"):
+                        self.player.repeat_mode = response["repeat_mode"]
+                    commands = response.get("commands") or []
+                    if commands:
+                        await self._enqueue_commands(commands, source="heartbeat")
             except asyncio.CancelledError:
                 break
             except Exception as exc:
