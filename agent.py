@@ -746,36 +746,51 @@ class Agent:
         elif action == "previous":
             await self.player.previous()
         elif action == "seek":
-            position = command.get("position") or command.get("seek_position")
+            position = command.get("position")
+            if position is None:
+                position = command.get("seek_position")
             if position is not None:
                 await self.player.seek(position)
+                await self._push_status_update()
         elif action == "set_repeat_mode":
             mode = command.get("repeat_mode") or command.get("mode")
             if mode:
                 self.player.repeat_mode = str(mode)
                 logger.info("Repeat mode set to %s", self.player.repeat_mode)
 
+    def _build_status_payload(self, status: dict) -> dict:
+        return {
+            "type": "status_update",
+            "status": "healthy" if self.player.is_healthy() else "error",
+            "current_volume": status.get("volume", 50.0),
+            "is_playing": bool(status.get("is_playing", False)),
+            "current_track_id": status.get("current_track_id"),
+            "current_playlist_id": status.get("current_playlist_id"),
+            # Keep payload small — full track metadata is not needed every tick.
+            "track_position": status.get("track_position"),
+            "playback_position": float(status.get("playback_position") or 0.0),
+            "playback_length": float(status.get("playback_length") or 0.0),
+            "playback_speed": 1.0,
+        }
+
+    async def _push_status_update(self) -> None:
+        """Send an anchor immediately instead of waiting for the next status tick.
+
+        Used after commands that move the timeline; otherwise the dashboard keeps
+        extrapolating from the pre-command anchor for up to a full interval.
+        """
+        if not (self.ws_client and self.ws_client.connected):
+            return
+        payload = self._build_status_payload(await self.player.get_status())
+        await self.ws_client.send(payload)
+        self._last_ws_payload = payload
+
     async def _handle_volume_control(self, command: dict) -> None:
         volume = command.get("volume")
         if volume is not None:
             await self.player.set_volume(volume)
             # Non-blocking: queue a slim status update (sender coalesces duplicates).
-            if self.ws_client and self.ws_client.connected:
-                status = await self.player.get_status()
-                payload = {
-                    "type": "status_update",
-                    "status": "healthy" if self.player.is_healthy() else "error",
-                    "current_volume": status.get("volume", 50.0),
-                    "is_playing": bool(status.get("is_playing", False)),
-                    "current_track_id": status.get("current_track_id"),
-                    "current_playlist_id": status.get("current_playlist_id"),
-                    "track_position": status.get("track_position"),
-                    "playback_position": float(status.get("playback_position") or 0.0),
-                    "playback_length": float(status.get("playback_length") or 0.0),
-                    "playback_speed": 1.0,
-                }
-                await self.ws_client.send(payload)
-                self._last_ws_payload = payload
+            await self._push_status_update()
             logger.info("Volume set to %s", volume)
 
     async def _handle_ad_control(self, command: dict) -> None:

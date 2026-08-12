@@ -83,6 +83,7 @@ class MusicPlayer:
         self._play_lock = asyncio.Lock()
         self._progress_position_ms: int = -1
         self._progress_changed_at: float = time.monotonic()
+        self._seeked_at: float = 0.0
         self._frozen_track_id: Optional[Any] = None
         self._frozen_restarts: int = 0
 
@@ -174,6 +175,21 @@ class MusicPlayer:
             self.player.audio_set_volume(int(self.volume))
         if self.ad_player and self._ad_playing:
             self._force_ad_player_volume(max(int(self.volume), 80))
+
+    def _intended_music_volume(self) -> int:
+        """Volume the music should return to once an ad finishes.
+
+        audio_get_volume() alone is not safe here: a track that is still warming
+        up is deliberately muted, so an ad starting in that window would capture
+        0 and leave the music silent for good after the ad.
+        """
+        try:
+            current = self.player.audio_get_volume() if self.player else -1
+        except Exception:
+            current = -1
+        if current is not None and current > 0:
+            return int(current)
+        return max(int(self.volume or 50), 5)
 
     def _ensure_music_audible(self) -> None:
         if not self.player:
@@ -312,8 +328,27 @@ class MusicPlayer:
         await self._play_current_track()
 
     async def seek(self, position_seconds: float) -> None:
-        if self.player:
-            self.player.set_time(int(float(position_seconds) * 1000))
+        if not self.player:
+            return
+        target_ms = max(int(float(position_seconds) * 1000), 0)
+        try:
+            length_ms = self.player.get_length()
+        except Exception:
+            length_ms = 0
+        if length_ms and length_ms > 0:
+            target_ms = min(target_ms, max(length_ms - 1000, 0))
+
+        self.player.set_time(target_ms)
+
+        # Without this the dashboard keeps reporting the pre-seek position: the
+        # status clamp below treats the post-seek 0 as a buffering artefact, and
+        # the stall watchdog sees the jump as "position stopped advancing".
+        self._seeked_at = time.monotonic()
+        self._last_known_position_s = target_ms / 1000.0
+        self._progress_position_ms = -1
+        self._progress_changed_at = time.monotonic()
+        self._stall_since = None
+        logger.info("Seek to %.1fs", target_ms / 1000.0)
 
     async def get_status(self) -> Dict[str, Any]:
         if not self.player:
@@ -478,6 +513,7 @@ class MusicPlayer:
         self._last_known_position_s = 0.0
         self._progress_position_ms = -1
         self._progress_changed_at = time.monotonic()
+        self._seeked_at = 0.0
 
         # libvlc refuses to restart a player that has reached a terminal state:
         # set_media() + play() leave it sitting in Ended and nothing ever starts. Every
@@ -830,6 +866,9 @@ class MusicPlayer:
         # Don't fight the initial buffer fill — a fresh start legitimately sits at 0.
         if self._play_started_at and (time.monotonic() - self._play_started_at) < self.FROZEN_GRACE_S:
             return False
+        # A seek re-fills the same buffer, so allow it the same grace as a start.
+        if self._seeked_at and (time.monotonic() - self._seeked_at) < self.FROZEN_GRACE_S:
+            return False
         try:
             pos_ms = int(self.player.get_time() or 0)
         except Exception:
@@ -1056,9 +1095,7 @@ class MusicPlayer:
             return
         if self._ad_overlay_mode == "fade_pause":
             fade_out = float(cfg.get("fade_out_seconds") or 2.0)
-            current = self.player.audio_get_volume()
-            if current < 0:
-                current = int(self.volume)
+            current = self._intended_music_volume()
             self._ad_pre_music_volume = current
             try:
                 self._ad_saved_position_ms = max(self.player.get_time(), 0)
@@ -1068,9 +1105,7 @@ class MusicPlayer:
             return
         duck_percent = int(cfg.get("duck_music_volume_percent") or 25)
         duck_percent = max(5, min(duck_percent, 80))
-        current = self.player.audio_get_volume()
-        if current < 0:
-            current = int(self.volume)
+        current = self._intended_music_volume()
         self._ad_pre_music_volume = current
         await self._fade_player_volume(self.player, current, duck_percent, 0.35)
 
@@ -1314,6 +1349,11 @@ class MusicPlayer:
                     overlay_mode=overlay_mode,
                     resume_was_playing=resume_was_playing,
                 )
+                # The music finished underneath a ducked ad, so the player is
+                # sitting in Ended: restoring its volume alone leaves the device
+                # silent until the stall watchdog eventually advances the track.
+                if overlay_mode == "duck" and after_action == "next" and self.current_playlist:
+                    await self.next()
         except Exception as exc:
             logger.warning("Could not restore music after ad: %s", exc)
 
