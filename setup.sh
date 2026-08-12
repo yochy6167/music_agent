@@ -68,11 +68,17 @@ echo "Updating apt packages..."
 sudo apt-get update -qq
 
 echo "Installing system dependencies..."
+# pulseaudio + libasound2-plugins are named explicitly on purpose. The player uses
+# VLC's ALSA output (its PulseAudio output glitches on the Pi) with device "default",
+# and "default" only reaches PulseAudio when the alsa-pulse bridge from
+# libasound2-plugins is present. Without it, audio goes straight to card 0, which
+# silently breaks `pactl` volume control and HDMI-vs-jack selection. vlc only pulls
+# in libpulse0, so neither package can be relied on as a transitive dependency.
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   python3 python3-venv python3-pip \
   vlc libvlc-dev \
   git curl \
-  alsa-utils
+  alsa-utils pulseaudio libasound2-plugins
 
 if [ ! -d ".venv" ]; then
   echo "Creating virtual environment..."
@@ -188,6 +194,18 @@ systemctl list-timers music-agent-nightly-reboot.timer --no-pager 2>/dev/null ||
 echo "Running quick health checks..."
 python3 -V
 ${PYTHON_BIN} -c "import httpx, websockets; print('python deps: ok')"
+
+echo "Verifying audio path..."
+if [[ -f /usr/share/alsa/alsa.conf.d/pulse.conf ]] || [[ -f /etc/alsa/conf.d/99-pulse.conf ]]; then
+  echo "  alsa->pulse bridge: present (VLC --aout=alsa reaches the PulseAudio default sink)"
+else
+  echo "  WARNING: alsa->pulse bridge missing. VLC will play straight to the first ALSA"
+  echo "           card, so 'pactl' volume and HDMI auto-selection will not take effect."
+  echo "           Force an explicit device instead, e.g. in the systemd unit:"
+  echo "           Environment=ALSA_AUDIO_DEVICE=plughw:CARD=vc4hdmi0,DEV=0"
+fi
+sudo -u "${SERVICE_USER}" XDG_RUNTIME_DIR="/run/user/${SERVICE_UID}" \
+  pactl get-default-sink 2>/dev/null | sed 's/^/  default sink: /' || true
 curl -fsS "$(python3 -c "import json; print(json.load(open('config.json'))['api_url'].rstrip('/') + '/health' )" 2>/dev/null)" >/dev/null 2>&1 || true
 
 echo "Setup complete."

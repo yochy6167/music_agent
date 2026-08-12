@@ -26,6 +26,10 @@ class MusicPlayer:
     FROZEN_MAX_RESTARTS = 2
     RESOLVE_BACKOFF_BASE_S = 120.0
     RESOLVE_BACKOFF_MAX_S = 3600.0
+    # Resolve the next track once the current one is this far through.
+    PREFETCH_AT_FRACTION = 0.60
+    # Cap for the above, so tracks of unknown length still get prefetched.
+    PREFETCH_MAX_WAIT_S = 150.0
 
     def __init__(self, api_url: str, device_token: str) -> None:
         self.api_url = api_url.rstrip("/")
@@ -72,7 +76,8 @@ class MusicPlayer:
         # track_id -> (failure_count, retry_not_before_monotonic)
         self._failed_urls: Dict[str, tuple] = {}
         self._prefetch_task: Optional[asyncio.Task] = None
-        self._url_cache_ttl_s = 45 * 60
+        # Kept well under YouTube's link lifetime; a stale entry means a failed start.
+        self._url_cache_ttl_s = 15 * 60
         self._play_started_at: float = 0.0
         self._last_known_position_s: float = 0.0
         self._play_lock = asyncio.Lock()
@@ -410,7 +415,9 @@ class MusicPlayer:
         async with self._play_lock:
             await self._play_current_track_locked(_skip_depth=_skip_depth)
 
-    async def _play_current_track_locked(self, *, _skip_depth: int = 0) -> None:
+    async def _play_current_track_locked(
+        self, *, _skip_depth: int = 0, _fresh_retry: bool = False
+    ) -> None:
         if not self.current_playlist or not self.player:
             return
         if _skip_depth >= min(len(self.current_playlist), 12):
@@ -422,7 +429,8 @@ class MusicPlayer:
             return
 
         track = self.current_playlist[self.current_index]
-        cached = self._get_cached_url(track)
+        cached = None if _fresh_retry else self._get_cached_url(track)
+        used_cached_url = cached is not None
         if cached:
             logger.info("Using prefetched URL for track %s", track.get("id"))
             media_url = cached
@@ -471,6 +479,13 @@ class MusicPlayer:
         self._progress_position_ms = -1
         self._progress_changed_at = time.monotonic()
 
+        # libvlc refuses to restart a player that has reached a terminal state:
+        # set_media() + play() leave it sitting in Ended and nothing ever starts. Every
+        # natural end-of-track transition hit this, which is why playback died a few
+        # songs in and only came back ~10s later when the stall watchdog issued its own
+        # stop(). Resetting here is what makes an unassisted transition work.
+        await self._reset_player_for_new_media()
+
         self.player.set_media(media)
         # libvlc keeps its own reference once the media is attached to the player;
         # dropping ours here avoids leaking one media object per track.
@@ -486,26 +501,89 @@ class MusicPlayer:
         except Exception:
             pass
 
+        # A prefetched YouTube URL can be rejected by the time it is used (the CDN
+        # link is only good for a while), and VLC then goes straight to Ended/Error
+        # within a fraction of a second. Without handling that here the track is
+        # silently skipped and the branch stays quiet until the watchdog notices.
+        # _expect_playing guards against a stop/pause that landed during warmup: that
+        # leaves VLC in the same state as a failure but must not advance the playlist.
+        if self._expect_playing and self._failed_to_start():
+            if used_cached_url and not _fresh_retry:
+                logger.warning(
+                    "Track %s would not open with the prefetched URL — re-resolving",
+                    track.get("id"),
+                )
+                self._invalidate_cached_url(track)
+                await self._play_current_track_locked(
+                    _skip_depth=_skip_depth, _fresh_retry=True
+                )
+                return
+            logger.error(
+                "Track %s failed to start even with a fresh URL — skipping",
+                track.get("id"),
+            )
+            self._mark_resolve_failed(track)
+            self.current_index = (self.current_index + 1) % len(self.current_playlist)
+            await self._play_current_track_locked(_skip_depth=_skip_depth + 1)
+            return
+
         self._play_started_at = time.monotonic()
         self._progress_changed_at = time.monotonic()
         if warmed:
             logger.info("Playing track %s (buffer ready)", self.current_track_id)
         else:
             logger.warning(
-                "Playing track %s (buffer warmup timed out — may stutter briefly)",
+                "Playing track %s (buffer warmup slow — may stutter briefly)",
                 self.current_track_id,
             )
         # Resolve the *next* track in the background so song transitions are near-instant.
         self._schedule_prefetch_next()
+
+    async def _reset_player_for_new_media(self, player: Any = None) -> None:
+        """Return a media player to a state from which play() is honoured.
+
+        stop() is asynchronous, so we also wait for libvlc to actually tear the old
+        input down; starting new media while the previous one is still closing lets the
+        tail of that teardown cancel the fresh playback.
+        """
+        player = player or self.player
+        if not player or not vlc:
+            return
+        try:
+            if player.get_state() == vlc.State.NothingSpecial:
+                return
+            player.stop()
+        except Exception:
+            return
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            try:
+                if player.get_state() in (vlc.State.NothingSpecial, vlc.State.Stopped):
+                    return
+            except Exception:
+                return
+
+    def _failed_to_start(self) -> bool:
+        """True when VLC gave up on the media instead of starting playback."""
+        if not self.player or not vlc:
+            return False
+        try:
+            state = self.player.get_state()
+        except Exception:
+            return False
+        return state in (vlc.State.Error, vlc.State.Ended, vlc.State.Stopped)
 
     async def _wait_for_playback_buffer(self, timeout_s: float = 12.0) -> bool:
         """Wait until VLC leaves Buffering and stays in Playing long enough to fill cache."""
         if not self.player or not vlc:
             await asyncio.sleep(0.5)
             return False
-        deadline = time.monotonic() + timeout_s
+        started_at = time.monotonic()
+        deadline = started_at + timeout_s
         stable_since: Optional[float] = None
         saw_playing = False
+        saw_active = False
         while time.monotonic() < deadline:
             try:
                 state = self.player.get_state()
@@ -513,10 +591,18 @@ class MusicPlayer:
                 await asyncio.sleep(0.2)
                 continue
             if state in (vlc.State.Error, vlc.State.Ended, vlc.State.Stopped):
-                return False
+                # play() is asynchronous, so until this media is seen opening the state
+                # still describes the previous one. Treating that as failure aborted the
+                # warmup after ~150ms and reported a bogus timeout.
+                if saw_active or time.monotonic() - started_at >= 2.0:
+                    return False
+                await asyncio.sleep(0.05)
+                continue
             if state in (vlc.State.Opening, vlc.State.Buffering):
+                saw_active = True
                 stable_since = None
             elif state == vlc.State.Playing:
+                saw_active = True
                 saw_playing = True
                 # Prefer a bit of decoded audio in the pipe (pos>0) + stable Playing.
                 try:
@@ -613,10 +699,32 @@ class MusicPlayer:
             return
         self._prefetch_task = loop.create_task(self._prefetch_next_track())
 
+    async def _wait_until_prefetch_point(self) -> None:
+        """Delay prefetching until the current track is most of the way through.
+
+        Resolving right after a track starts produced URLs that were ~5 minutes old
+        by the time they were used, and YouTube had already invalidated them. Waiting
+        keeps the link fresh while still resolving well before the track ends.
+        """
+        deadline = time.monotonic() + self.PREFETCH_MAX_WAIT_S
+        while time.monotonic() < deadline:
+            if not self._expect_playing or self._ad_playing:
+                return
+            try:
+                length_ms = self.player.get_length() if self.player else 0
+                pos_ms = self.player.get_time() if self.player else 0
+            except Exception:
+                return
+            # Unknown length (live/odd streams): fall back to the timeout.
+            if length_ms and length_ms > 0 and pos_ms >= length_ms * self.PREFETCH_AT_FRACTION:
+                return
+            await asyncio.sleep(2.0)
+
     async def _prefetch_next_track(self) -> None:
         try:
-            # Let current track finish silent buffer warmup before competing for CPU/net.
+            # Let the current track finish its buffer warmup before competing for CPU.
             await asyncio.sleep(5.0)
+            await self._wait_until_prefetch_point()
             if not self.current_playlist or self._ad_playing:
                 return
             nxt = self._next_track_index()
@@ -653,8 +761,9 @@ class MusicPlayer:
             return
         if length_ms <= 0 or pos_ms < 0:
             return
-        # When 70% of the track has played, make sure next URL is cached.
-        if pos_ms < length_ms * 0.70:
+        # Safety net for the scheduled prefetch: same trigger point, so a cancelled or
+        # crashed prefetch task still gets the next URL cached before the track ends.
+        if pos_ms < length_ms * self.PREFETCH_AT_FRACTION:
             return
         nxt = self._next_track_index()
         if nxt is None:
@@ -1069,7 +1178,15 @@ class MusicPlayer:
                         completed=False, error="vlc_media_failed", schedule_config=schedule_config
                     )
                     return False
+                # Same libvlc constraint as music: a player left in a terminal state
+                # ignores play(), and the stop() issued when the previous ad finished is
+                # asynchronous, so make sure it has landed before reusing the player.
+                await self._reset_player_for_new_media(self.ad_player)
                 self.ad_player.set_media(media)
+                try:
+                    media.release()
+                except Exception:
+                    pass
                 result = self.ad_player.play()
                 if result != 0:
                     await self._finish_ad_playback_unlocked(
