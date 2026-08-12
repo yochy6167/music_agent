@@ -31,7 +31,9 @@ class MusicPlayer:
     # Cap for the above, so tracks of unknown length still get prefetched.
     PREFETCH_MAX_WAIT_S = 150.0
     # Silence held after a seek while VLC refetches and refills its buffer.
-    SEEK_REBUFFER_S = 1.5
+    SEEK_REBUFFER_S = 1.2
+    # Extra silence after un-pausing, covering the audio output restart.
+    SEEK_RESUME_MUTE_S = 0.3
 
     def __init__(self, api_url: str, device_token: str) -> None:
         self.api_url = api_url.rstrip("/")
@@ -140,10 +142,21 @@ class MusicPlayer:
             event_manager = self.player.event_manager()
             event_manager.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_track_end)
             self.ad_instance = self.instance
-            if platform.system() == "Windows":
+            ad_aout = {"Windows": "waveout", "Linux": "pulse"}.get(platform.system())
+            if ad_aout:
+                # The ad needs a different output module than the music, not just a
+                # separate player. Two ALSA clients starve this card as soon as they
+                # overlap: measured over six ads, sharing ALSA gave 12.6s of dead
+                # air that got worse with each ad, while sending only the ad through
+                # PulseAudio gave 2.9s and improved with each ad. The music itself
+                # must stay on ALSA — VLC's PulseAudio output cannot hold a long
+                # HTTP stream here (28s of dropouts in a 25s window).
                 try:
-                    ad_vlc_options = [o for o in vlc_options if not o.startswith("--aout")]
-                    ad_vlc_options.append("--aout=waveout")
+                    ad_vlc_options = [
+                        o for o in vlc_options
+                        if not o.startswith(("--aout", "--alsa-audio-device"))
+                    ]
+                    ad_vlc_options.append(f"--aout={ad_aout}")
                     self.ad_instance = vlc.Instance(ad_vlc_options)
                 except Exception:
                     self.ad_instance = self.instance
@@ -368,19 +381,22 @@ class MusicPlayer:
         self._progress_position_ms = -1
         self._progress_changed_at = time.monotonic()
         self._stall_since = None
+        logger.info("Seek to %.1fs", target_ms / 1000.0)
 
         if bridged:
             await asyncio.sleep(self.SEEK_REBUFFER_S)
             try:
                 self.player.set_pause(False)
+                # Restarting the audio output costs ~150ms of silence. Staying
+                # muted across it keeps that inside the one intentional gap
+                # instead of surfacing as a second glitch after audio resumed.
+                await asyncio.sleep(self.SEEK_RESUME_MUTE_S)
                 if resume_volume is not None:
                     self.player.audio_set_volume(resume_volume)
             except Exception:
                 pass
             self._seeked_at = time.monotonic()
             self._progress_changed_at = time.monotonic()
-
-        logger.info("Seek to %.1fs", target_ms / 1000.0)
 
     async def get_status(self) -> Dict[str, Any]:
         if not self.player:

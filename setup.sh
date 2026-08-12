@@ -80,6 +80,39 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   git curl \
   alsa-utils pulseaudio libasound2-plugins
 
+configure_pulseaudio_scheduling() {
+  # The Pi's bcm2835 output does not keep time well enough for PulseAudio's
+  # timer-based scheduling, and the difference is only visible once music and an
+  # ad play together. Measured over six ads: with these settings 2.2s of dead
+  # air, with PulseAudio's defaults 16.9s and getting worse with every ad.
+  # Larger fixed buffers were also tried and were worse again (5.9s), so the
+  # small buffer here is deliberate and should not be "optimised" upward.
+  local pa=/etc/pulse/default.pa
+  local daemon=/etc/pulse/daemon.conf
+  [ -f "$pa" ] || return 0
+
+  if ! grep -qE '^load-module module-udev-detect.*tsched=0' "$pa"; then
+    sudo sed -i -E \
+      's|^(load-module module-udev-detect)(.*)$|\1\2 tsched=0|' "$pa"
+    echo "  pulseaudio: disabled timer-based scheduling"
+  fi
+  if ! grep -qE '^default-fragment-size-msec *= *15' "$daemon"; then
+    sudo sed -i -E '/^ *;? *default-fragment-size-msec/d' "$daemon"
+    echo 'default-fragment-size-msec = 15' | sudo tee -a "$daemon" >/dev/null
+    echo "  pulseaudio: pinned 15ms fragments"
+  fi
+
+  # PulseAudio only reads these at startup; it respawns on the next client.
+  local pa_user="${SUDO_USER:-${USER:-pi}}"
+  local pa_uid
+  pa_uid="$(id -u "${pa_user}" 2>/dev/null || echo 1000)"
+  sudo -u "${pa_user}" env "XDG_RUNTIME_DIR=/run/user/${pa_uid}" \
+    pulseaudio -k >/dev/null 2>&1 || true
+}
+
+echo "Configuring PulseAudio scheduling for this sound card..."
+configure_pulseaudio_scheduling
+
 if [ ! -d ".venv" ]; then
   echo "Creating virtual environment..."
   python3 -m venv .venv

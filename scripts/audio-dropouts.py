@@ -35,14 +35,15 @@ from datetime import datetime
 os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 
 RATE = 44100
-FRAME_MS = 20
+FRAME_MS = 10
 # A peak of 300 (~-40 dBFS) sounded safe but flagged ordinary quiet passages and
 # fade-outs as gaps, which is what produced a batch of phantom "dropouts".
 SILENCE_PEAK = 60
-# Short enough to catch a stutter, long enough to ignore genuine quiet passages.
-MIN_GAP_S = 0.12
-# Beyond this it is a stop / track change, not a dropout.
-MAX_GAP_S = 6.0
+# Choppy playback is made of gaps well under 100ms, and a 120ms floor hid them
+# entirely: an ad that sounded like two seconds of stutter reported only 480ms.
+MIN_GAP_S = 0.03
+# Gaps closer together than this are reported as one episode of choppiness.
+BURST_JOIN_S = 1.0
 
 duration_s = float(sys.argv[1]) if len(sys.argv) > 1 else 900.0
 
@@ -75,6 +76,39 @@ was_loud = False
 gap_peak = gap_frames = gap_dead = 0
 loud_frames = total_frames = dropouts = 0
 next_summary = time.monotonic() + 60.0
+burst = None
+
+
+def flush_burst():
+    """Print one line per episode of choppiness rather than per tiny gap."""
+    global burst
+    if burst is None:
+        return
+    span = burst["last_end"] - burst["start"]
+    if burst["count"] == 1:
+        print(f"{burst['kind']:<11} {stamp(burst['start'])}  "
+              f"{burst['silence'] * 1000:6.0f}ms  peak={burst['peak']:5d}", flush=True)
+    else:
+        print(f"{burst['kind']:<11} {stamp(burst['start'])}  "
+              f"{burst['count']:3d} gaps over {span:5.1f}s, "
+              f"silent {burst['silence'] * 1000:6.0f}ms  peak={burst['peak']:5d}",
+              flush=True)
+    burst = None
+
+
+def add_gap(start, end, gap, kind, peak):
+    global burst
+    if burst is not None and (burst["kind"] != kind
+                              or start - burst["last_end"] > BURST_JOIN_S):
+        flush_burst()
+    if burst is None:
+        burst = {"start": start, "count": 0, "silence": 0.0,
+                 "last_end": end, "kind": kind, "peak": peak}
+    burst["count"] += 1
+    burst["silence"] += gap
+    burst["last_end"] = end
+    burst["peak"] = max(burst["peak"], peak)
+
 
 try:
     while time.monotonic() < deadline:
@@ -88,22 +122,17 @@ try:
 
         if peak > SILENCE_PEAK:
             loud_frames += 1
+            if burst is not None and now - burst["last_end"] > BURST_JOIN_S:
+                flush_burst()
             if silent_since is not None and was_loud:
                 gap = now - silent_since
                 dead = gap_dead / max(gap_frames, 1)
                 starved = dead >= 0.5
-                kind = "NO-DATA" if starved else "quiet-audio"
-                detail = f"peak={gap_peak:5d}  silent_frames={dead * 100:3.0f}%"
-                if MIN_GAP_S <= gap <= MAX_GAP_S:
+                if gap >= MIN_GAP_S:
                     if starved:
                         dropouts += 1
-                    print(f"{kind:<11} {stamp(silent_since)}  {gap * 1000:6.0f}ms  "
-                          f"{detail}", flush=True)
-                elif gap > MAX_GAP_S:
-                    if starved:
-                        dropouts += 1
-                    print(f"{kind:<11} {stamp(silent_since)}  {gap:6.1f}s  "
-                          f"{detail}  (long)", flush=True)
+                    add_gap(silent_since, now, gap,
+                            "NO-DATA" if starved else "quiet-audio", gap_peak)
             silent_since = None
             gap_peak = gap_frames = gap_dead = 0
             was_loud = True
@@ -118,11 +147,13 @@ try:
 
         if time.monotonic() >= next_summary:
             next_summary += 60.0
+            flush_burst()
             pct = 100.0 * loud_frames / max(total_frames, 1)
             print(f"-- {stamp(now)} audio present {pct:5.1f}% of last minute, "
                   f"real dropouts so far {dropouts}", flush=True)
             loud_frames = total_frames = 0
 finally:
+    flush_burst()
     proc.kill()
     print(f"done, {dropouts} real dropout(s) detected "
           f"(NO-DATA gaps only; quiet-audio lines are the music itself)", flush=True)
