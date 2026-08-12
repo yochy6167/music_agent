@@ -44,6 +44,8 @@ SILENCE_PEAK = 60
 MIN_GAP_S = 0.03
 # Gaps closer together than this are reported as one episode of choppiness.
 BURST_JOIN_S = 1.0
+# Beyond this a silence is playback being stopped, not the output being starved.
+STOPPED_S = 20.0
 
 duration_s = float(sys.argv[1]) if len(sys.argv) > 1 else 900.0
 
@@ -86,8 +88,10 @@ def flush_burst():
         return
     span = burst["last_end"] - burst["start"]
     if burst["count"] == 1:
+        length = (f"{burst['silence']:6.1f}s " if burst["silence"] >= 10
+                  else f"{burst['silence'] * 1000:6.0f}ms")
         print(f"{burst['kind']:<11} {stamp(burst['start'])}  "
-              f"{burst['silence'] * 1000:6.0f}ms  peak={burst['peak']:5d}", flush=True)
+              f"{length}  peak={burst['peak']:5d}", flush=True)
     else:
         print(f"{burst['kind']:<11} {stamp(burst['start'])}  "
               f"{burst['count']:3d} gaps over {span:5.1f}s, "
@@ -129,10 +133,16 @@ try:
                 dead = gap_dead / max(gap_frames, 1)
                 starved = dead >= 0.5
                 if gap >= MIN_GAP_S:
-                    if starved:
+                    if not starved:
+                        kind = "quiet-audio"
+                    elif gap >= STOPPED_S:
+                        # Nothing starves an output for this long. Counting it
+                        # reported a stop pressed in the dashboard as a fault.
+                        kind = "stopped?"
+                    else:
+                        kind = "NO-DATA"
                         dropouts += 1
-                    add_gap(silent_since, now, gap,
-                            "NO-DATA" if starved else "quiet-audio", gap_peak)
+                    add_gap(silent_since, now, gap, kind, gap_peak)
             silent_since = None
             gap_peak = gap_frames = gap_dead = 0
             was_loud = True
