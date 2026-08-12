@@ -26,6 +26,10 @@ class MusicPlayer:
     FROZEN_MAX_RESTARTS = 2
     RESOLVE_BACKOFF_BASE_S = 120.0
     RESOLVE_BACKOFF_MAX_S = 3600.0
+    # Consecutive unresolvable tracks that suggest the playlist itself is stale.
+    RELOAD_AFTER_FAILURES = 3
+    # Floor between self-triggered reloads, so a bad network cannot cause a storm.
+    RELOAD_COOLDOWN_S = 300.0
     # Resolve the next track once the current one is this far through.
     PREFETCH_AT_FRACTION = 0.60
     # Cap for the above, so tracks of unknown length still get prefetched.
@@ -90,6 +94,8 @@ class MusicPlayer:
         self._seeked_at: float = 0.0
         self._frozen_track_id: Optional[Any] = None
         self._frozen_restarts: int = 0
+        self._last_reload_at: float = 0.0
+        self._resolve_failures_since_reload: int = 0
 
         self._init_vlc()
 
@@ -467,6 +473,70 @@ class MusicPlayer:
         self.current_index = 0
         logger.info("Loaded playlist %s (%d items)", playlist_id, len(items))
 
+    async def reload_playlist(self, playlist_id: Optional[int] = None) -> bool:
+        """Re-fetch the loaded playlist without interrupting what is playing.
+
+        A refresh on the server can delete tracks, and the agent otherwise keeps
+        serving the list it fetched when playback started: every deleted track is
+        then a failed resolve and several seconds of silence. play() cannot be
+        reused for this because it deliberately skips loading when the playlist is
+        already loaded, and it would restart the track from zero.
+        """
+        target = int(playlist_id or self.current_playlist_id or 0)
+        if not target:
+            logger.warning("Playlist reload requested with no playlist loaded")
+            return False
+
+        data = await self._fetch_playlist(target)
+        items = (data or {}).get("items") or []
+        if not items:
+            # Keeping a stale list beats dropping playback over a failed request
+            # or an empty response, so this deliberately does not clear anything.
+            logger.warning(
+                "Playlist %s reload returned nothing usable — keeping the loaded list",
+                target,
+            )
+            return False
+
+        # The swap itself is held against the play lock: a track start that is
+        # mid-flight picks its next track from the cursor, and must not see the
+        # list and the cursor from two different versions of the playlist.
+        async with self._play_lock:
+            playing_id = self.current_track_id
+            before = len(self.current_playlist)
+            self.current_playlist = items
+            self.current_playlist_id = target
+            self._last_reload_at = time.monotonic()
+            self._resolve_failures_since_reload = 0
+
+            index = next(
+                (i for i, item in enumerate(items) if str(item.get("id")) == str(playing_id)),
+                None,
+            )
+            if index is not None:
+                self.current_index = index
+            else:
+                # The track playing right now is gone upstream. It keeps playing
+                # from VLC's own buffer; only the cursor needs to land somewhere
+                # sane so the following track is picked from the new list.
+                self.current_index = min(max(self.current_index, 0), len(items) - 1)
+
+            logger.info(
+                "Playlist %s reloaded: %d -> %d item(s); current track %s %s",
+                target,
+                before,
+                len(items),
+                playing_id,
+                "kept in place" if index is not None else "no longer in the playlist",
+            )
+
+            # Anything prefetched now refers to the old ordering.
+            if self._prefetch_task and not self._prefetch_task.done():
+                self._prefetch_task.cancel()
+            if self._expect_playing:
+                self._schedule_prefetch_next()
+        return True
+
     async def _fetch_playlist(self, playlist_id: int) -> Optional[Dict[str, Any]]:
         url = f"{self.api_url}/api/v1/playlists/{playlist_id}"
         headers = {"X-Device-Token": self.device_token}
@@ -750,6 +820,34 @@ class MusicPlayer:
             failures,
             backoff,
         )
+        self._resolve_failures_since_reload += 1
+        self._maybe_reload_after_failures()
+
+    def _maybe_reload_after_failures(self) -> None:
+        """Re-fetch the playlist once several tracks in a row cannot be resolved.
+
+        The server sends a reload command when a refresh removes tracks, but that
+        command can be missed while a device is offline. Repeated resolve failures
+        are the symptom of exactly that, so the agent recovers on its own instead
+        of paying a silence for every removed track until the next restart.
+        """
+        if self._resolve_failures_since_reload < self.RELOAD_AFTER_FAILURES:
+            return
+        if time.monotonic() - self._last_reload_at < self.RELOAD_COOLDOWN_S:
+            return
+        if not self.current_playlist_id:
+            return
+        loop = self._event_loop or asyncio.get_event_loop()
+        # Fire and forget: this runs inside the play path, which must not wait on
+        # an HTTP round trip before it moves on to the next track.
+        self._last_reload_at = time.monotonic()
+        self._resolve_failures_since_reload = 0
+        logger.info(
+            "%s tracks failed to resolve — re-fetching playlist %s in the background",
+            self.RELOAD_AFTER_FAILURES,
+            self.current_playlist_id,
+        )
+        loop.create_task(self.reload_playlist())
 
     def _resolve_backoff_active(self, track: Dict[str, Any]) -> bool:
         key = self._cache_key(track)

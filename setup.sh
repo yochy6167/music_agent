@@ -203,7 +203,9 @@ Description=Nightly reboot for Neeman Music Agent Pi
 
 [Service]
 Type=oneshot
-ExecStart=/sbin/systemctl reboot
+# systemctl lives in /usr/bin on Raspberry Pi OS; /sbin/systemctl does not exist
+# there, and the unit failed silently every night with status=203/EXEC.
+ExecStart=/usr/bin/systemctl reboot
 EOF
 
 sudo tee "$REBOOT_TIMER" > /dev/null <<'EOF'

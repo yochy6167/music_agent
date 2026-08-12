@@ -484,7 +484,15 @@ class Agent:
                     timeout_s = 25.0
                 elif (action or "").upper().replace("-", "_") == "UPDATE_SOFTWARE":
                     timeout_s = 60.0
-                elif command_type == "playback_control" and (action or "").lower() in {"play", "next", "skip", "previous"}:
+                elif command_type == "playback_control" and (action or "").lower() in {
+                    "play",
+                    "next",
+                    "skip",
+                    "previous",
+                    # A reload waits for any track start already in flight, so it
+                    # needs the same headroom as the start it may be queued behind.
+                    "reload_playlist",
+                }:
                     # YouTube resolve can take a while on Pi; don't kill it too early,
                     # but never exceed this — subprocess yt-dlp has its own timeout.
                     timeout_s = 70.0
@@ -757,6 +765,19 @@ class Agent:
             if mode:
                 self.player.repeat_mode = str(mode)
                 logger.info("Repeat mode set to %s", self.player.repeat_mode)
+        elif action == "reload_playlist":
+            # Sent when a refresh changed the playlist on the server. play() would
+            # not re-fetch a playlist it already holds, and would restart the track.
+            playlist_id = command.get("playlist_id")
+            if playlist_id is None or str(playlist_id) == str(self.player.current_playlist_id):
+                await self.player.reload_playlist(playlist_id)
+                await self._push_status_update()
+            else:
+                logger.info(
+                    "Ignoring reload for playlist %s — this device has %s loaded",
+                    playlist_id,
+                    self.player.current_playlist_id,
+                )
 
     def _build_status_payload(self, status: dict) -> dict:
         return {
