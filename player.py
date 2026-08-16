@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import platform
+import random
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
@@ -53,6 +54,8 @@ class MusicPlayer:
         self.current_index: int = 0
         self.volume: float = 50.0
         self.repeat_mode: str = "repeat_all"
+        self.shuffle: bool = False
+        self._original_playlist: list = []
         self.current_track: Optional[Dict[str, Any]] = None
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self.on_track_ended: Optional[
@@ -98,6 +101,69 @@ class MusicPlayer:
         self._resolve_failures_since_reload: int = 0
 
         self._init_vlc()
+
+    def _shuffle_enabled(self) -> bool:
+        return bool(self.shuffle) or self.repeat_mode == "shuffle"
+
+    def set_repeat_mode(self, mode: Optional[str]) -> None:
+        """Update repeat/shuffle mode and re-order the loaded playlist if needed."""
+        if not mode:
+            return
+        previous = self._shuffle_enabled()
+        current_id = self.current_track_id
+        self.repeat_mode = str(mode)
+        self.shuffle = self.repeat_mode == "shuffle"
+        now_shuffle = self._shuffle_enabled()
+        if now_shuffle and not previous:
+            self._reshuffle_playlist(keep_track_id=current_id)
+            if current_id is not None:
+                self.current_index = 0
+            logger.info("Shuffle enabled — playlist order randomized")
+        elif previous and not now_shuffle:
+            self._restore_original_order(keep_track_id=current_id)
+            logger.info("Shuffle disabled — restored playlist order")
+
+    def _reshuffle_playlist(self, keep_track_id=None, avoid_first_id=None) -> None:
+        """Fisher-Yates shuffle of the canonical playlist. No song repeats in a cycle."""
+        source = list(self._original_playlist or self.current_playlist or [])
+        if len(source) <= 1:
+            self.current_playlist = source
+            return
+        shuffled = source[:]
+        random.shuffle(shuffled)
+        if (
+            avoid_first_id is not None
+            and shuffled
+            and str(shuffled[0].get("id")) == str(avoid_first_id)
+            and len(shuffled) > 1
+        ):
+            swap_with = random.randint(1, len(shuffled) - 1)
+            shuffled[0], shuffled[swap_with] = shuffled[swap_with], shuffled[0]
+        if keep_track_id is not None:
+            for i, track in enumerate(shuffled):
+                if str(track.get("id")) == str(keep_track_id):
+                    shuffled.insert(0, shuffled.pop(i))
+                    break
+        self.current_playlist = shuffled
+        logger.info(
+            "Shuffled playlist (%s tracks), first=%s",
+            len(shuffled),
+            shuffled[0].get("title") if shuffled else None,
+        )
+
+    def _restore_original_order(self, keep_track_id=None) -> None:
+        if self._original_playlist:
+            self.current_playlist = list(self._original_playlist)
+        if keep_track_id is not None and self.current_playlist:
+            for i, track in enumerate(self.current_playlist):
+                if str(track.get("id")) == str(keep_track_id):
+                    self.current_index = i
+                    return
+        if not self.current_playlist:
+            self.current_index = 0
+            return
+        if self.current_index is None or self.current_index >= len(self.current_playlist):
+            self.current_index = 0
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._event_loop = loop
@@ -223,7 +289,13 @@ class MusicPlayer:
             target = int(self._ad_pre_music_volume or self.volume or 50)
             self.player.audio_set_volume(max(5, min(100, target)))
 
-    async def play(self, playlist_id: Optional[int] = None, track_id: Optional[int] = None) -> None:
+    async def play(
+        self,
+        playlist_id: Optional[int] = None,
+        track_id: Optional[int] = None,
+        shuffle: Optional[bool] = None,
+        restart_shuffled: bool = False,
+    ) -> None:
         if not self.player:
             logger.error("VLC player not initialized")
             return
@@ -232,12 +304,28 @@ class MusicPlayer:
             return
         self._ensure_music_audible()
 
+        if shuffle is True:
+            self.set_repeat_mode("shuffle")
+        elif shuffle is False and self.repeat_mode == "shuffle":
+            self.set_repeat_mode("repeat_all")
+        if shuffle is True and track_id is None:
+            restart_shuffled = True
+
         if playlist_id and (playlist_id != self.current_playlist_id or not self.current_playlist):
             await self._load_playlist(int(playlist_id))
 
         if not self.current_playlist:
             logger.error("No playlist loaded")
             return
+
+        if self._shuffle_enabled() and self.current_playlist:
+            if restart_shuffled and track_id is None:
+                self._reshuffle_playlist()
+                self.current_index = 0
+                logger.info("Starting shuffled playlist from the beginning")
+            elif track_id is not None:
+                self._reshuffle_playlist(keep_track_id=track_id)
+                self.current_index = 0
 
         if track_id is not None:
             self._set_index_for_track(track_id)
@@ -337,7 +425,14 @@ class MusicPlayer:
     async def next(self) -> None:
         if not self.current_playlist:
             return
-        self.current_index = (self.current_index + 1) % len(self.current_playlist)
+        at_end = self.current_index >= len(self.current_playlist) - 1
+        if at_end and self._shuffle_enabled():
+            last_id = self.current_playlist[self.current_index].get("id")
+            self._reshuffle_playlist(avoid_first_id=last_id)
+            self.current_index = 0
+            logger.info("Reshuffled playlist for a new cycle")
+        else:
+            self.current_index = (self.current_index + 1) % len(self.current_playlist)
         self._expect_playing = True
         await self._play_current_track()
 
@@ -465,12 +560,18 @@ class MusicPlayer:
         if not playlist_data:
             logger.error("Failed to load playlist %s", playlist_id)
             self.current_playlist = []
+            self._original_playlist = []
             return
 
         items = playlist_data.get("items", [])
-        self.current_playlist = items
+        self._original_playlist = list(items)
         self.current_playlist_id = playlist_id
-        self.current_index = 0
+        if self._shuffle_enabled() and items:
+            self._reshuffle_playlist()
+            self.current_index = 0
+        else:
+            self.current_playlist = items
+            self.current_index = 0
         logger.info("Loaded playlist %s (%d items)", playlist_id, len(items))
 
     async def reload_playlist(self, playlist_id: Optional[int] = None) -> bool:
@@ -504,13 +605,17 @@ class MusicPlayer:
         async with self._play_lock:
             playing_id = self.current_track_id
             before = len(self.current_playlist)
-            self.current_playlist = items
+            self._original_playlist = list(items)
             self.current_playlist_id = target
+            if self._shuffle_enabled():
+                self._reshuffle_playlist(keep_track_id=playing_id)
+            else:
+                self.current_playlist = items
             self._last_reload_at = time.monotonic()
             self._resolve_failures_since_reload = 0
 
             index = next(
-                (i for i, item in enumerate(items) if str(item.get("id")) == str(playing_id)),
+                (i for i, item in enumerate(self.current_playlist) if str(item.get("id")) == str(playing_id)),
                 None,
             )
             if index is not None:
@@ -519,7 +624,7 @@ class MusicPlayer:
                 # The track playing right now is gone upstream. It keeps playing
                 # from VLC's own buffer; only the cursor needs to land somewhere
                 # sane so the following track is picked from the new list.
-                self.current_index = min(max(self.current_index, 0), len(items) - 1)
+                self.current_index = min(max(self.current_index, 0), len(self.current_playlist) - 1)
 
             logger.info(
                 "Playlist %s reloaded: %d -> %d item(s); current track %s %s",
@@ -870,6 +975,9 @@ class MusicPlayer:
             if nxt >= len(self.current_playlist):
                 return None
             return nxt
+        if self.repeat_mode == "single":
+            return None
+        # shuffle behaves like repeat_all over the already-randomized list
         return (self.current_index + 1) % len(self.current_playlist)
 
     def _schedule_prefetch_next(self) -> None:

@@ -694,7 +694,7 @@ class Agent:
                 await asyncio.sleep(2)
                 continue
             if response.get("repeat_mode"):
-                self.player.repeat_mode = response["repeat_mode"]
+                self.player.set_repeat_mode(response["repeat_mode"])
             commands = response.get("commands") or []
             if commands:
                 await self._enqueue_commands(commands, source="long_poll")
@@ -729,13 +729,21 @@ class Agent:
 
     async def _handle_playback_control(self, command: dict) -> None:
         action = command.get("action")
-        if "repeat_mode" in command:
-            self.player.repeat_mode = command.get("repeat_mode") or self.player.repeat_mode
+        if command.get("repeat_mode"):
+            self.player.set_repeat_mode(command.get("repeat_mode"))
+        elif "shuffle" in command:
+            if command.get("shuffle"):
+                self.player.set_repeat_mode("shuffle")
+            elif self.player.repeat_mode == "shuffle":
+                self.player.set_repeat_mode("repeat_all")
 
         if action == "play":
+            shuffle = command.get("shuffle")
             await self.player.play(
                 playlist_id=command.get("playlist_id"),
                 track_id=command.get("track_id"),
+                shuffle=shuffle,
+                restart_shuffled=bool(shuffle) and not command.get("track_id"),
             )
         elif action == "pause":
             await self.player.pause()
@@ -763,7 +771,7 @@ class Agent:
         elif action == "set_repeat_mode":
             mode = command.get("repeat_mode") or command.get("mode")
             if mode:
-                self.player.repeat_mode = str(mode)
+                self.player.set_repeat_mode(str(mode))
                 logger.info("Repeat mode set to %s", self.player.repeat_mode)
         elif action == "reload_playlist":
             # Sent when a refresh changed the playlist on the server. play() would
@@ -1010,7 +1018,7 @@ class Agent:
                 # response silently loses commands queued while the WS was down.
                 if response:
                     if response.get("repeat_mode"):
-                        self.player.repeat_mode = response["repeat_mode"]
+                        self.player.set_repeat_mode(response["repeat_mode"])
                     commands = response.get("commands") or []
                     if commands:
                         await self._enqueue_commands(commands, source="heartbeat")
