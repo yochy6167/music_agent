@@ -113,9 +113,12 @@ class MusicPlayer:
 
     def set_shuffle(self, enabled: bool) -> None:
         """Toggle shuffle without changing loop/repeat mode."""
+        enabled = bool(enabled)
+        if enabled == self._shuffle_enabled() and self.repeat_mode != "shuffle":
+            return
         previous = self._shuffle_enabled()
         current_id = self.current_track_id
-        self.shuffle = bool(enabled)
+        self.shuffle = enabled
         if self.repeat_mode == "shuffle":
             self.repeat_mode = "repeat_all"
         now_shuffle = self._shuffle_enabled()
@@ -133,11 +136,17 @@ class MusicPlayer:
         if not mode:
             return
         if mode == "shuffle":
+            was_shuffle = self._shuffle_enabled()
+            was_legacy = self.repeat_mode == "shuffle"
             self.set_shuffle(True)
             self.repeat_mode = "repeat_all"
-            logger.info("Legacy repeat_mode=shuffle → shuffle on + repeat_all")
+            if not was_shuffle or was_legacy:
+                logger.info("Legacy repeat_mode=shuffle → shuffle on + repeat_all")
             return
-        self.repeat_mode = str(mode)
+        mode = str(mode)
+        if mode == self.repeat_mode:
+            return
+        self.repeat_mode = mode
         logger.info(
             "Repeat/loop mode set to: %s (shuffle=%s)",
             mode,
