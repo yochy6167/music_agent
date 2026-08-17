@@ -105,14 +105,19 @@ class MusicPlayer:
     def _shuffle_enabled(self) -> bool:
         return bool(self.shuffle) or self.repeat_mode == "shuffle"
 
-    def set_repeat_mode(self, mode: Optional[str]) -> None:
-        """Update repeat/shuffle mode and re-order the loaded playlist if needed."""
-        if not mode:
-            return
+    def _loop_mode(self) -> str:
+        """Repeat/loop behavior only — shuffle is independent."""
+        if self.repeat_mode == "shuffle":
+            return "repeat_all"
+        return self.repeat_mode or "repeat_all"
+
+    def set_shuffle(self, enabled: bool) -> None:
+        """Toggle shuffle without changing loop/repeat mode."""
         previous = self._shuffle_enabled()
         current_id = self.current_track_id
-        self.repeat_mode = str(mode)
-        self.shuffle = self.repeat_mode == "shuffle"
+        self.shuffle = bool(enabled)
+        if self.repeat_mode == "shuffle":
+            self.repeat_mode = "repeat_all"
         now_shuffle = self._shuffle_enabled()
         if now_shuffle and not previous:
             self._reshuffle_playlist(keep_track_id=current_id)
@@ -122,6 +127,22 @@ class MusicPlayer:
         elif previous and not now_shuffle:
             self._restore_original_order(keep_track_id=current_id)
             logger.info("Shuffle disabled — restored playlist order")
+
+    def set_repeat_mode(self, mode: Optional[str]) -> None:
+        """Update loop/repeat mode. Legacy 'shuffle' maps to shuffle+repeat_all."""
+        if not mode:
+            return
+        if mode == "shuffle":
+            self.set_shuffle(True)
+            self.repeat_mode = "repeat_all"
+            logger.info("Legacy repeat_mode=shuffle → shuffle on + repeat_all")
+            return
+        self.repeat_mode = str(mode)
+        logger.info(
+            "Repeat/loop mode set to: %s (shuffle=%s)",
+            mode,
+            self._shuffle_enabled(),
+        )
 
     def _reshuffle_playlist(self, keep_track_id=None, avoid_first_id=None) -> None:
         """Fisher-Yates shuffle of the canonical playlist. No song repeats in a cycle."""
@@ -305,9 +326,9 @@ class MusicPlayer:
         self._ensure_music_audible()
 
         if shuffle is True:
-            self.set_repeat_mode("shuffle")
-        elif shuffle is False and self.repeat_mode == "shuffle":
-            self.set_repeat_mode("repeat_all")
+            self.set_shuffle(True)
+        elif shuffle is False:
+            self.set_shuffle(False)
         if shuffle is True and track_id is None:
             restart_shuffled = True
 
@@ -540,7 +561,22 @@ class MusicPlayer:
         length_sec = max(self.player.get_length() / 1000.0, 0.0)
         track_position = None
         if self.current_playlist:
-            track_position = {"index": self.current_index, "total": len(self.current_playlist)}
+            # Report original playlist order so the dashboard matches the song list
+            # even while shuffle plays a different order.
+            source = self._original_playlist or self.current_playlist
+            original_index = None
+            track_id = self.current_track_id or (
+                self.current_track.get("id") if self.current_track else None
+            )
+            if track_id is not None and source:
+                for i, track in enumerate(source):
+                    if str(track.get("id")) == str(track_id):
+                        original_index = i
+                        break
+            track_position = {
+                "index": original_index if original_index is not None else self.current_index,
+                "total": len(source) if source else len(self.current_playlist),
+            }
         return {
             "is_playing": is_playing,
             "volume": self.volume,
@@ -968,16 +1004,17 @@ class MusicPlayer:
     def _next_track_index(self) -> Optional[int]:
         if not self.current_playlist:
             return None
-        if self.repeat_mode == "repeat_one":
+        loop = self._loop_mode()
+        if loop == "repeat_one":
             return self.current_index
-        if self.repeat_mode == "play_once":
+        if loop == "play_once":
             nxt = self.current_index + 1
             if nxt >= len(self.current_playlist):
                 return None
             return nxt
-        if self.repeat_mode == "single":
+        if loop == "single":
             return None
-        # shuffle behaves like repeat_all over the already-randomized list
+        # repeat_all (shuffle only affects order)
         return (self.current_index + 1) % len(self.current_playlist)
 
     def _schedule_prefetch_next(self) -> None:
@@ -1225,18 +1262,31 @@ class MusicPlayer:
             except Exception as exc:
                 logger.warning("on_track_ended callback failed: %s", exc)
 
-        if self.repeat_mode == "repeat_one":
+        loop = self._loop_mode()
+        if loop == "repeat_one":
+            logger.info("Repeat mode: repeat_one - replaying current track")
             await self._play_current_track()
+            return
+
+        if loop == "single":
+            logger.info("Repeat mode: single - stopping playback")
+            await self.stop()
             return
 
         if not self.current_playlist:
             return
 
-        if self.repeat_mode == "play_once":
+        if loop == "play_once":
             if self.current_index >= len(self.current_playlist) - 1:
+                logger.info("Repeat mode: play_once - reached end of playlist, stopping")
                 await self.stop()
                 return
 
+        logger.info(
+            "Repeat mode: %s (shuffle=%s) - playing next track",
+            loop,
+            self._shuffle_enabled(),
+        )
         await self.next()
 
     def _absolutize_url(self, url: str) -> str:

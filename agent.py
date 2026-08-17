@@ -695,6 +695,8 @@ class Agent:
                 continue
             if response.get("repeat_mode"):
                 self.player.set_repeat_mode(response["repeat_mode"])
+            if "shuffle" in response and response.get("shuffle") is not None:
+                self.player.set_shuffle(bool(response["shuffle"]))
             commands = response.get("commands") or []
             if commands:
                 await self._enqueue_commands(commands, source="long_poll")
@@ -729,13 +731,13 @@ class Agent:
 
     async def _handle_playback_control(self, command: dict) -> None:
         action = command.get("action")
+        # Handle repeat_mode / shuffle independently
         if command.get("repeat_mode"):
             self.player.set_repeat_mode(command.get("repeat_mode"))
-        elif "shuffle" in command:
-            if command.get("shuffle"):
-                self.player.set_repeat_mode("shuffle")
-            elif self.player.repeat_mode == "shuffle":
-                self.player.set_repeat_mode("repeat_all")
+            logger.info("Updated repeat_mode to: %s", command.get("repeat_mode"))
+        if "shuffle" in command and command.get("shuffle") is not None:
+            self.player.set_shuffle(bool(command.get("shuffle")))
+            logger.info("Updated shuffle to: %s", command.get("shuffle"))
 
         if action == "play":
             shuffle = command.get("shuffle")
@@ -772,7 +774,14 @@ class Agent:
             mode = command.get("repeat_mode") or command.get("mode")
             if mode:
                 self.player.set_repeat_mode(str(mode))
-                logger.info("Repeat mode set to %s", self.player.repeat_mode)
+                logger.info(
+                    "Repeat mode set to %s (shuffle=%s)",
+                    self.player.repeat_mode,
+                    self.player._shuffle_enabled(),
+                )
+            if "shuffle" in command and command.get("shuffle") is not None:
+                self.player.set_shuffle(bool(command.get("shuffle")))
+                logger.info("Shuffle set to %s", command.get("shuffle"))
         elif action == "reload_playlist":
             # Sent when a refresh changed the playlist on the server. play() would
             # not re-fetch a playlist it already holds, and would restart the track.
@@ -1019,6 +1028,8 @@ class Agent:
                 if response:
                     if response.get("repeat_mode"):
                         self.player.set_repeat_mode(response["repeat_mode"])
+                    if "shuffle" in response and response.get("shuffle") is not None:
+                        self.player.set_shuffle(bool(response["shuffle"]))
                     commands = response.get("commands") or []
                     if commands:
                         await self._enqueue_commands(commands, source="heartbeat")
