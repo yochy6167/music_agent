@@ -318,6 +318,7 @@ export XDG_RUNTIME_DIR=/run/user/1000
 cd ~/music_agent
 
 URL=$(.venv/bin/python -m yt_dlp -q --no-warnings --skip-download \
+  --extractor-args 'youtube:player_client=android' \
   -f '140/bestaudio' -g 'https://www.youtube.com/watch?v=VIDEO_ID' | head -1)
 
 # ספירת תקלות אודיו של ליבת VLC (עובד לכל מודול פלט)

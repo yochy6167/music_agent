@@ -822,9 +822,14 @@ class MusicPlayer:
                     _skip_depth=_skip_depth, _fresh_retry=True
                 )
                 return
+            try:
+                vlc_state = self.player.get_state() if self.player else None
+            except Exception:
+                vlc_state = None
             logger.error(
-                "Track %s failed to start even with a fresh URL — skipping",
+                "Track %s failed to start even with a fresh URL (vlc state=%s) — skipping",
                 track.get("id"),
+                vlc_state,
             )
             self._mark_resolve_failed(track)
             self.current_index = (self.current_index + 1) % len(self.current_playlist)
@@ -1735,6 +1740,14 @@ class MusicPlayer:
             "--no-warnings",
             "--no-playlist",
             "--skip-download",
+            # Without a JS runtime yt-dlp falls back to ANDROID_VR. Those googlevideo
+            # URLs 403 unless the client sends a *small bounded* Range header (open
+            # Range, a Range past the first megabyte, and a request with no Range
+            # all return 403). VLC's HTTP module does none of that, so every track
+            # went Ended within a second. The android client still returns a
+            # progressive m4a that VLC can GET in one request (measured 200 + Playing).
+            "--extractor-args",
+            "youtube:player_client=android",
             # Prefer AAC/m4a (140) over webm/opus (251): VLC on Pi often stutters on opus DASH.
             "-f",
             "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
