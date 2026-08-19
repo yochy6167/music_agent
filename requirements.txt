@@ -1,4 +1,4 @@
 httpx
 websockets
 python-vlc
-yt-dlp
+yt-dlp[default]

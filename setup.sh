@@ -113,6 +113,25 @@ configure_pulseaudio_scheduling() {
 echo "Configuring PulseAudio scheduling for this sound card..."
 configure_pulseaudio_scheduling
 
+install_deno() {
+  # yt-dlp no longer solves YouTube JS challenges in-process. Deno is the runtime
+  # it enables by default; without it, extraction falls back to clients that this
+  # network flags as bots.
+  local pa_user="${SUDO_USER:-${USER:-pi}}"
+  local deno_home
+  deno_home="$(eval echo "~${pa_user}")/.deno"
+  if [[ -x "${deno_home}/bin/deno" ]]; then
+    echo "Deno already installed at ${deno_home}/bin/deno"
+    return 0
+  fi
+  echo "Installing Deno for yt-dlp YouTube JS challenges..."
+  sudo -u "${pa_user}" env DENO_INSTALL="${deno_home}" \
+    sh -c 'curl -fsSL https://deno.land/install.sh | sh' || \
+    echo "WARNING: Deno install failed; YouTube extraction may require cookies."
+}
+
+install_deno
+
 if [ ! -d ".venv" ]; then
   echo "Creating virtual environment..."
   python3 -m venv .venv
@@ -123,7 +142,9 @@ source .venv/bin/activate
 
 echo "Installing Python dependencies..."
 pip install --upgrade pip
+# YouTube extraction needs the EJS helper package; the default extra pulls it in.
 pip install -r requirements.txt
+pip install -U "yt-dlp[default]"
 
 chmod +x "${SCRIPT_DIR}/scripts/set-system-volume.sh" 2>/dev/null || true
 
@@ -171,6 +192,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=SYSTEM_SINK_VOLUME=90
 Environment=AUDIO_PREFER=auto
 Environment=XDG_RUNTIME_DIR=/run/user/${SERVICE_UID}
+Environment=PATH=/home/${SERVICE_USER}/.deno/bin:/usr/local/bin:/usr/bin:/bin
 ${WSL_AUDIO_ENV}
 ExecStartPre=/bin/bash ${VOLUME_SCRIPT}
 ExecStart=${PYTHON_BIN} ${SCRIPT_DIR}/main.py

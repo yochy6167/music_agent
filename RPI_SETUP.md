@@ -318,7 +318,7 @@ export XDG_RUNTIME_DIR=/run/user/1000
 cd ~/music_agent
 
 URL=$(.venv/bin/python -m yt_dlp -q --no-warnings --skip-download \
-  --extractor-args 'youtube:player_client=android' \
+  --force-ipv4 --extractor-args 'youtube:player_client=android' \
   -f '140/bestaudio' -g 'https://www.youtube.com/watch?v=VIDEO_ID' | head -1)
 
 # ספירת תקלות אודיו של ליבת VLC (עובד לכל מודול פלט)
@@ -350,6 +350,19 @@ pactl list sinks | grep -E 'Name:|Latency'
 
 הערכים הצפויים הם עשרות מילישניות (נמדד `configured 59954 usec`), ותגובת
 `audio_set_volume` נמדדה ב-0.13–0.30 שניות מרגע הקריאה ועד שינוי בפועל ביציאת האודיו.
+
+### YouTube: "Sign in to confirm you're not a bot"
+
+זה **לא** באג ב-VLC. yt-dlp נכשל עוד לפני שיש URL לנגן. על ה-Pi הזה מדדנו ש־**IPv6 מסומן כבוט** אצל YouTube ו־**IPv4 לא**: אותה רצועה נכשלת עם `--force-ipv6` ומצליחה עם `--force-ipv4`. לכן החילוץ מקובע ל-IPv4 וללקוח `android` (URL ש-VLC יודע לפתוח ב-GET רגיל).
+
+אם זה חוזר אחרי שה-IPv4 גם מסומן:
+
+1. לא לדלג על כל הפלייליסט — זה רק מעמיק את החסימה. הסוכן עוצר לבד אחרי שגיאת בוט.
+2. לייצא עוגיות YouTube (חשבון ייעודי, לא האישי) לקובץ Netscape ולהניח ב־
+   `~/.soundops_agent/youtube.cookies.txt`.
+3. Deno צריך להיות ב-`PATH` (`~/.deno/bin`) — yt-dlp דורש runtime JS לחילוץ מודרני.
+
+עדכון VLC לא פותר את השגיאה הזו.
 
 ---
 

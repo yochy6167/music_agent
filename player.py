@@ -31,6 +31,8 @@ class MusicPlayer:
     RELOAD_AFTER_FAILURES = 3
     # Floor between self-triggered reloads, so a bad network cannot cause a storm.
     RELOAD_COOLDOWN_S = 300.0
+    # After YouTube's bot-check, further yt-dlp calls only make the flag worse.
+    YOUTUBE_BOT_COOLDOWN_S = 180.0
     # Resolve the next track once the current one is this far through.
     PREFETCH_AT_FRACTION = 0.60
     # Cap for the above, so tracks of unknown length still get prefetched.
@@ -99,6 +101,7 @@ class MusicPlayer:
         self._frozen_restarts: int = 0
         self._last_reload_at: float = 0.0
         self._resolve_failures_since_reload: int = 0
+        self._youtube_blocked_until: float = 0.0
 
         self._init_vlc()
 
@@ -221,6 +224,10 @@ class MusicPlayer:
                 "--file-caching=3000",
                 "--network-caching=5000",
                 "--http-reconnect",
+                # googlevideo URLs are signed to the IP family that resolved them.
+                # This Pi's IPv6 prefix is currently bot-flagged by YouTube while
+                # IPv4 is not; pinning VLC to IPv4 keeps playback on that family.
+                "--ipv4",
             ]
         )
         if platform.system() == "Windows":
@@ -745,6 +752,14 @@ class MusicPlayer:
                 self._mark_resolve_failed(track)
 
         if not media_url:
+            if self._youtube_bot_blocked():
+                # Every track would fail the same way. Skipping the playlist just
+                # fires a dozen more yt-dlp processes and deepens the bot flag.
+                logger.error(
+                    "YouTube bot-check active — stopping auto-advance instead of skipping"
+                )
+                self._expect_playing = False
+                return
             logger.warning("No playable URL, skipping track %s", track.get("id"))
             self.current_index = (self.current_index + 1) % len(self.current_playlist)
             await self._play_current_track_locked(_skip_depth=_skip_depth + 1)
@@ -1732,6 +1747,15 @@ class MusicPlayer:
     async def _extract_youtube_url_subprocess(self, youtube_url: str) -> Optional[str]:
         import sys
 
+        if self._youtube_bot_blocked():
+            remaining = self._youtube_blocked_until - time.monotonic()
+            logger.warning(
+                "Skipping yt-dlp for %s — YouTube bot-check cooldown (%.0fs left)",
+                youtube_url,
+                remaining,
+            )
+            return None
+
         cmd = [
             sys.executable,
             "-m",
@@ -1740,6 +1764,11 @@ class MusicPlayer:
             "--no-warnings",
             "--no-playlist",
             "--skip-download",
+            # This Pi has working IPv4 and a YouTube-flagged IPv6 prefix. yt-dlp
+            # otherwise prefers AAAA and every extract dies with "Sign in to confirm
+            # you're not a bot". Measured: --force-ipv4 returns a playable URL,
+            # --force-ipv6 does not.
+            "--force-ipv4",
             # Without a JS runtime yt-dlp falls back to ANDROID_VR. Those googlevideo
             # URLs 403 unless the client sends a *small bounded* Range header (open
             # Range, a Range past the first megabyte, and a request with no Range
@@ -1754,15 +1783,30 @@ class MusicPlayer:
             "-g",
             youtube_url,
         ]
+        cookies = Path.home() / ".soundops_agent" / "youtube.cookies.txt"
+        if cookies.is_file() and cookies.stat().st_size > 0:
+            cmd.extend(["--cookies", str(cookies)])
+
+        env = os.environ.copy()
+        deno_bin = str(Path.home() / ".deno" / "bin")
+        env["PATH"] = deno_bin + os.pathsep + env.get("PATH", "")
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             err = (stderr or b"").decode(errors="replace").strip()
             logger.error("yt-dlp exited %s: %s", proc.returncode, err[:500])
+            if self._is_youtube_bot_error(err):
+                self._youtube_blocked_until = time.monotonic() + self.YOUTUBE_BOT_COOLDOWN_S
+                logger.error(
+                    "YouTube bot-check — pausing resolves for %.0fs so skip-storms cannot deepen the flag",
+                    self.YOUTUBE_BOT_COOLDOWN_S,
+                )
             return None
         lines = (stdout or b"").decode(errors="replace").strip().splitlines()
         for line in lines:
@@ -1770,3 +1814,11 @@ class MusicPlayer:
             if url.startswith("http://") or url.startswith("https://"):
                 return url
         return None
+
+    def _youtube_bot_blocked(self) -> bool:
+        return time.monotonic() < self._youtube_blocked_until
+
+    @staticmethod
+    def _is_youtube_bot_error(err: str) -> bool:
+        lowered = err.lower()
+        return "not a bot" in lowered or "sign in to confirm" in lowered
