@@ -44,6 +44,10 @@
 
 Write → הכנס SD ל-Pi → חבר Ethernet (או Wi‑Fi) → חשמל.
 
+אם מחברים לWi-Fi אפשר להריץ את הסקריפט הבא:
+```bash
+./wifi_connect.sh
+```
 המתן ~2 דקות להפעלה ראשונה.
 
 ---
@@ -97,7 +101,7 @@ chmod +x scripts/deploy-from-pc.sh
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
-git clone yochy6167/music_agent
+git clone https://github.com/yochy6167/music_agent.git
 cd ~/music_agent
 cp config.json.example config.json
 # ערוך config.json אם כתובות השרת שונות
@@ -258,6 +262,90 @@ ssh pi@music-agent-01
 - לבדיקת סטטוס בכל שלב: `tailscale status`.
 
 ---
+## חלק ז' - בדיקות עם אוזניות בלוטוס 
+## 1. התקנת החבילות והפעלת רכיבי החומרה
+
+```bash
+# עדכון מקורות והתקנת תמיכה ב-Bluetooth, PulseAudio ונגן mpv
+sudo apt update
+sudo apt install -y bluez bluetooth pi-bluetooth linux-firmware pulseaudio pulseaudio-utils pulseaudio-module-bluetooth mpv
+
+# שחרור חסימת תוכנה והפעלת רכיב ה-Bluetooth
+sudo rfkill unblock bluetooth
+sudo systemctl restart bluetooth
+sudo hciconfig hci0 up
+
+# הפעלת שרת השמע ברקע והגדרתו לרוץ תמיד
+pulseaudio --start
+sudo loginctl enable-linger $USER
+systemctl --user enable pulseaudio
+
+```
+
+---
+
+## 2. צימוד וחיבור האוזניות (Bluetooth)
+
+```bash
+# כניסה לניהול ה-Bluetooth
+bluetoothctl
+
+# בתוך ממשק bluetoothctl:
+power on
+agent on
+default-agent
+scan on
+
+# ביצוע צימוד, שמירה וחיבור (החלף במידת הצורך בכתובת ה-MAC של האוזניות):
+pair 1C:57:DC:21:DA:48
+trust 1C:57:DC:21:DA:48
+connect 1C:57:DC:21:DA:48
+exit
+
+# חיבור מהיר בעתיד (במידה והתנתק):
+bluetoothctl connect 1C:57:DC:21:DA:48
+
+```
+
+---
+
+## 3. הגדרת שמע ובדיקת נגינה (AirPods)
+
+```bash
+# הצגת יציאות השמע הזמינות והאינדקס שלהן
+pactl list sinks short
+
+# הגדרת ה-AirPods כפלט ברירת המחדל (לפי שם היציאה או האינדקס שלה):
+pactl set-default-sink bluez_sink.1C_57_DC_21_DA_48.a2dp_sink
+
+# ביטול השתקה והגדרת עוצמת שמע ל-80%
+pactl set-sink-mute bluez_sink.1C_57_DC_21_DA_48.a2dp_sink 0
+pactl set-sink-volume bluez_sink.1C_57_DC_21_DA_48.a2dp_sink 80%
+
+# הזרמת מוזיקת בדיקה בשידור חי:
+mpv --ao=pulse https://stream.radioparadise.com/mp3-128
+
+```
+
+---
+
+## 4. מיתוג ומעבר שמע בחיבור הסופי (HDMI / AUX)
+
+```bash
+# 1. החזרת ברירת המחדל לכרטיס הקול המקומי (לפי אינדקס 1 או שם הכרטיס):
+pactl set-default-sink 1
+# או:
+pactl set-default-sink alsa_output.platform-fe00b840.mailbox.stereo-fallback
+
+# 2. בחירת יציאת החומרה הפיזית:
+amixer cset numid=3 2   # ניתוב סאונד ל-HDMI
+amixer cset numid=3 1   # ניתוב סאונד ל-AUX (שקע אוזניות 3.5 מ"מ)
+amixer cset numid=3 0   # זיהוי אוטומטי
+
+# 3. מעבר חזרה ל-AirPods במידת הצורך:
+pactl set-default-sink bluez_sink.1C_57_DC_21_DA_48.a2dp_sink
+
+```
 
 ## מכשירים נוספים
 
