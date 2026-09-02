@@ -364,6 +364,7 @@ class Agent:
         loop = asyncio.get_running_loop()
         self.player.set_event_loop(loop)
         self.player.on_track_ended = self._log_track_playback
+        self.player.on_one_shot_ended = self._on_one_shot_ended
         self.player.on_ad_transition_check = self._on_ad_transition_check
         self.player.on_ad_finished = self._on_ad_finished
         await self._refresh_transition_campaigns()
@@ -1011,6 +1012,23 @@ class Agent:
                 "track_id": track_id,
                 "playlist_id": playlist_id,
                 "duration_played": round(duration_played, 2),
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    async def _on_one_shot_ended(
+        self,
+        track_id: Optional[int],
+        playlist_id: Optional[int],
+    ) -> None:
+        """After a one-shot YouTube play, tell the server so it can resume the previous playlist."""
+        if not playlist_id:
+            return
+        await self.client.log_playback_event(
+            {
+                "event_type": "track_ended",
+                "track_id": track_id,
+                "playlist_id": playlist_id,
                 "ended_at": datetime.now(timezone.utc).isoformat(),
             }
         )
