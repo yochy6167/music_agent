@@ -63,9 +63,6 @@ class MusicPlayer:
         self.on_track_ended: Optional[
             Callable[[int, Optional[int], float], Union[Awaitable[None], None]]
         ] = None
-        self.on_one_shot_ended: Optional[
-            Callable[[Optional[int], Optional[int]], Union[Awaitable[None], None]]
-        ] = None
         self.on_ad_transition_check: Optional[Callable[[], Union[Awaitable[bool], bool]]] = None
         self.on_ad_finished: Optional[
             Callable[..., Union[Awaitable[None], None]]
@@ -1281,12 +1278,8 @@ class MusicPlayer:
             except Exception:
                 duration_played = 0.0
 
-        loop = self._loop_mode()
-
         # Don't block the next track on analytics — log in the background.
-        # One-shot ("single") must log AFTER stop(), otherwise the server resumes
-        # the previous playlist and this stop() kills that resume.
-        if loop != "single" and self.on_track_ended and ended_track_id is not None:
+        if self.on_track_ended and ended_track_id is not None:
             try:
                 result = self.on_track_ended(
                     int(ended_track_id),
@@ -1298,6 +1291,7 @@ class MusicPlayer:
             except Exception as exc:
                 logger.warning("on_track_ended callback failed: %s", exc)
 
+        loop = self._loop_mode()
         if loop == "repeat_one":
             logger.info("Repeat mode: repeat_one - replaying current track")
             await self._play_current_track()
@@ -1306,13 +1300,6 @@ class MusicPlayer:
         if loop == "single":
             logger.info("Repeat mode: single - stopping playback")
             await self.stop()
-            if self.on_one_shot_ended:
-                try:
-                    result = self.on_one_shot_ended(ended_track_id, ended_playlist_id)
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception as exc:
-                    logger.warning("on_one_shot_ended callback failed: %s", exc)
             return
 
         if not self.current_playlist:
