@@ -296,9 +296,42 @@ class MusicPlayer:
     async def set_volume(self, volume: float) -> None:
         self.volume = float(volume)
         if self.player and not (self._ad_playing and self._ad_overlay_mode == "fade_pause"):
-            self.player.audio_set_volume(int(self.volume))
+            self._apply_intended_volume(int(self.volume))
         if self.ad_player and self._ad_playing:
             self._force_ad_player_volume(max(int(self.volume), 80))
+
+    def _vlc_software_volume(self) -> Optional[int]:
+        """What libvlc is actually mixing, not the dashboard-facing self.volume."""
+        if not self.player:
+            return None
+        try:
+            current = self.player.audio_get_volume()
+        except Exception:
+            return None
+        if current is None:
+            return None
+        return int(current)
+
+    def _apply_intended_volume(self, volume: Optional[int] = None) -> None:
+        """Push volume to VLC and clear a stuck mute flag.
+
+        audio_set_volume() before the ALSA output is fully up is often a no-op, and
+        a leftover mute then leaves the device silent while the dashboard still
+        shows self.volume (the intended level).
+        """
+        if not self.player:
+            return
+        target = max(0, min(100, int(self.volume if volume is None else volume)))
+        try:
+            setter = getattr(self.player, "audio_set_mute", None)
+            if setter:
+                setter(False)
+        except Exception:
+            pass
+        try:
+            self.player.audio_set_volume(target)
+        except Exception:
+            pass
 
     def _intended_music_volume(self) -> int:
         """Volume the music should return to once an ad finishes.
@@ -307,24 +340,57 @@ class MusicPlayer:
         up is deliberately muted, so an ad starting in that window would capture
         0 and leave the music silent for good after the ad.
         """
-        try:
-            current = self.player.audio_get_volume() if self.player else -1
-        except Exception:
-            current = -1
+        current = self._vlc_software_volume()
         if current is not None and current > 0:
-            return int(current)
+            return current
         return max(int(self.volume or 50), 5)
 
-    def _ensure_music_audible(self) -> None:
-        if not self.player:
+    def _ensure_music_audible(self, *, reason: str = "play") -> None:
+        if not self.player or self._ad_playing:
             return
-        try:
-            current = self.player.audio_get_volume()
-        except Exception:
+        if float(self.volume or 0) <= 0:
             return
-        if current is not None and current <= 0:
-            target = int(self._ad_pre_music_volume or self.volume or 50)
-            self.player.audio_set_volume(max(5, min(100, target)))
+        current = self._vlc_software_volume()
+        if current is not None and current > 0:
+            return
+        target = max(5, min(100, int(self._ad_pre_music_volume or self.volume or 50)))
+        logger.warning(
+            "VLC software volume was %s while dashboard volume is %s (%s) — restoring to %s",
+            current,
+            int(self.volume),
+            reason,
+            target,
+        )
+        self._apply_intended_volume(target)
+
+    async def _unmute_after_warmup(self, target_vol: int) -> None:
+        """Retry unmute until libvlc actually accepts it.
+
+        On this Pi the ALSA output is often not ready at the first Playing sample,
+        so a single audio_set_volume() after warmup is silently dropped and the
+        track stays at 0 for its whole duration.
+        """
+        target = max(0, min(100, int(target_vol)))
+        if target <= 0:
+            return
+        last = None
+        for attempt in range(6):
+            self._apply_intended_volume(target)
+            await asyncio.sleep(0.15)
+            last = self._vlc_software_volume()
+            if last is not None and last > 0:
+                if attempt:
+                    logger.info(
+                        "VLC volume applied on attempt %s (now %s)",
+                        attempt + 1,
+                        last,
+                    )
+                return
+        logger.warning(
+            "VLC software volume still %s after warmup unmute (intended %s)",
+            last,
+            target,
+        )
 
     async def play(
         self,
@@ -529,8 +595,8 @@ class MusicPlayer:
                 # muted across it keeps that inside the one intentional gap
                 # instead of surfacing as a second glitch after audio resumed.
                 await asyncio.sleep(self.SEEK_RESUME_MUTE_S)
-                if resume_volume is not None:
-                    self.player.audio_set_volume(resume_volume)
+                restore = resume_volume if resume_volume and resume_volume > 0 else int(self.volume)
+                self._apply_intended_volume(restore)
             except Exception:
                 pass
             self._seeked_at = time.monotonic()
@@ -813,12 +879,14 @@ class MusicPlayer:
         except Exception:
             pass
         self.player.play()
-
-        warmed = await self._wait_for_playback_buffer(timeout_s=8.0)
+        # stop() rebuilt the ALSA output; mute the new one too so warmup stays silent.
         try:
-            self.player.audio_set_volume(target_vol)
+            self.player.audio_set_volume(0)
         except Exception:
             pass
+
+        warmed = await self._wait_for_playback_buffer(timeout_s=8.0)
+        await self._unmute_after_warmup(target_vol)
 
         # A prefetched YouTube URL can be rejected by the time it is used (the CDN
         # link is only good for a while), and VLC then goes straight to Ended/Error
@@ -1155,6 +1223,12 @@ class MusicPlayer:
         if self._play_lock.locked():
             self._progress_changed_at = time.monotonic()
             return False
+        # Seek briefly mutes on purpose; don't fight that 1.5s window.
+        if self._seeked_at and (time.monotonic() - self._seeked_at) < 2.0:
+            return False
+        # Playing + advancing position with VLC volume stuck at 0 looks healthy
+        # on the dashboard (it reports self.volume) but the branch is silent.
+        self._ensure_music_audible(reason="watchdog")
 
         try:
             state = self.player.get_state()
