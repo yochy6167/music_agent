@@ -351,6 +351,8 @@ class Agent:
         self._transition_campaigns: list = []
         self._transition_pick_index = 0
         self._ad_config_refresh_counter = 0
+        self._last_transition_refresh: float = 0.0
+        self._holiday_ads_paused = False
         self._ws_status_ticks = 0
         self._command_queue: "asyncio.Queue[dict]" = asyncio.Queue()
         self._control_queue: "asyncio.Queue[dict]" = asyncio.Queue()
@@ -701,8 +703,12 @@ class Agent:
             if commands:
                 await self._enqueue_commands(commands, source="long_poll")
 
+            prev_paused = self._holiday_ads_paused
+            if response and "holiday_ads_paused" in response:
+                self._holiday_ads_paused = bool(response.get("holiday_ads_paused"))
+
             self._ad_config_refresh_counter += 1
-            if self._ad_config_refresh_counter % 20 == 0:
+            if self._ad_config_refresh_counter % 20 == 0 or prev_paused != self._holiday_ads_paused:
                 await self._refresh_transition_campaigns()
 
     async def _handle_commands(self, commands: list) -> None:
@@ -874,10 +880,11 @@ class Agent:
                 data,
                 key=lambda c: (-int(c.get("priority", 0)), int(c.get("id", 0))),
             )
+            self._last_transition_refresh = time.time()
             logger.info("Loaded %s transition ad campaign(s)", len(self._transition_campaigns))
 
     def _pick_transition_campaign(self) -> Optional[dict]:
-        if not self._transition_campaigns:
+        if self._holiday_ads_paused or not self._transition_campaigns:
             return None
         top_priority = self._transition_campaigns[0].get("priority", 0)
         tier = [c for c in self._transition_campaigns if c.get("priority", 0) == top_priority]
@@ -891,6 +898,13 @@ class Agent:
         return pick
 
     async def _on_ad_transition_check(self) -> bool:
+        if time.time() - self._last_transition_refresh >= 60:
+            try:
+                await self._refresh_transition_campaigns()
+            except Exception as exc:
+                logger.warning("Failed to refresh transition campaigns: %s", exc)
+        if self._holiday_ads_paused:
+            return False
         self.player._tracks_since_ad += 1
         campaign = self._pick_transition_campaign()
         if not campaign:
@@ -1026,6 +1040,11 @@ class Agent:
                 # anything it returns has already been removed there. Ignoring the
                 # response silently loses commands queued while the WS was down.
                 if response:
+                    prev_paused = self._holiday_ads_paused
+                    if "holiday_ads_paused" in response:
+                        self._holiday_ads_paused = bool(response.get("holiday_ads_paused"))
+                    if prev_paused != self._holiday_ads_paused:
+                        await self._refresh_transition_campaigns()
                     if response.get("repeat_mode"):
                         self.player.set_repeat_mode(response["repeat_mode"])
                     if "shuffle" in response and response.get("shuffle") is not None:
