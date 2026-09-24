@@ -11,6 +11,11 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+
+class YoutubeResolveBlocked(Exception):
+    """YouTube refused a new stream URL, or a bot-check cooldown is still active."""
+
+
 try:
     import vlc  # type: ignore
 except Exception:  # pragma: no cover - runtime dependency
@@ -33,6 +38,9 @@ class MusicPlayer:
     RELOAD_COOLDOWN_S = 300.0
     # After YouTube's bot-check, further yt-dlp calls only make the flag worse.
     YOUTUBE_BOT_COOLDOWN_S = 180.0
+    # A URL that already started can be replayed through a bot-check. Signed
+    # googlevideo links usually outlive the 15-minute prefetch cache.
+    YOUTUBE_HOLD_URL_MAX_AGE_S = 2 * 60 * 60
     # Resolve the next track once the current one is this far through.
     PREFETCH_AT_FRACTION = 0.60
     # Cap for the above, so tracks of unknown length still get prefetched.
@@ -102,6 +110,11 @@ class MusicPlayer:
         self._last_reload_at: float = 0.0
         self._resolve_failures_since_reload: int = 0
         self._youtube_blocked_until: float = 0.0
+        self._youtube_resume_task: Optional[asyncio.Task] = None
+        # Last YouTube URL that actually started, so a bot-check can replay it.
+        self._youtube_hold_url: Optional[str] = None
+        self._youtube_hold_track_id: Optional[Any] = None
+        self._youtube_hold_saved_at: float = 0.0
 
         self._init_vlc()
 
@@ -792,7 +805,12 @@ class MusicPlayer:
             await self._play_current_track_locked(_skip_depth=_skip_depth)
 
     async def _play_current_track_locked(
-        self, *, _skip_depth: int = 0, _fresh_retry: bool = False
+        self,
+        *,
+        _skip_depth: int = 0,
+        _fresh_retry: bool = False,
+        _youtube_hold: bool = False,
+        media_url_override: Optional[str] = None,
     ) -> None:
         if not self.current_playlist or not self.player:
             return
@@ -805,26 +823,44 @@ class MusicPlayer:
             return
 
         track = self.current_playlist[self.current_index]
-        cached = None if _fresh_retry else self._get_cached_url(track)
-        used_cached_url = cached is not None
-        if cached:
-            logger.info("Using prefetched URL for track %s", track.get("id"))
-            media_url = cached
+        used_cached_url = False
+        media_url = None
+        blocked = False
+        if media_url_override:
+            media_url = media_url_override
+            used_cached_url = True
         else:
-            media_url = await self._get_media_url(track, use_cache=False)
-            if media_url:
-                self._put_cached_url(track, media_url)
+            cached = None if _fresh_retry else self._get_cached_url(track)
+            used_cached_url = cached is not None
+            if cached:
+                logger.info("Using prefetched URL for track %s", track.get("id"))
+                media_url = cached
             else:
-                self._mark_resolve_failed(track)
+                try:
+                    media_url = await self._get_media_url(track, use_cache=False)
+                except YoutubeResolveBlocked:
+                    media_url = None
+                    blocked = True
+                if media_url:
+                    self._put_cached_url(track, media_url)
+                elif not blocked:
+                    self._mark_resolve_failed(track)
 
         if not media_url:
-            if self._youtube_bot_blocked():
-                # Every track would fail the same way. Skipping the playlist just
-                # fires a dozen more yt-dlp processes and deepens the bot flag.
-                logger.error(
-                    "YouTube bot-check active — stopping auto-advance instead of skipping"
-                )
-                self._expect_playing = False
+            youtube_track = track.get("source") == "youtube"
+            if blocked or (youtube_track and self._youtube_bot_blocked()):
+                # Skipping the playlist would fire a yt-dlp process per track and
+                # deepen the bot flag. Stopping auto-advance is worse: the branch
+                # stays silent until somebody presses play. Keep audio going.
+                if _youtube_hold:
+                    logger.warning(
+                        "YouTube bot-check — track %s still blocked; waiting to resolve again",
+                        track.get("id"),
+                    )
+                    self._expect_playing = True
+                    self._schedule_youtube_resume()
+                    return
+                await self._continue_through_youtube_block()
                 return
             logger.warning("No playable URL, skipping track %s", track.get("id"))
             self.current_index = (self.current_index + 1) % len(self.current_playlist)
@@ -895,6 +931,17 @@ class MusicPlayer:
         # _expect_playing guards against a stop/pause that landed during warmup: that
         # leaves VLC in the same state as a failure but must not advance the playlist.
         if self._expect_playing and self._failed_to_start():
+            if _youtube_hold:
+                logger.warning(
+                    "Track %s could not be replayed during YouTube bot-check — waiting to resolve again",
+                    track.get("id"),
+                )
+                if str(track.get("id")) == str(self._youtube_hold_track_id):
+                    self._youtube_hold_url = None
+                    self._youtube_hold_track_id = None
+                self._expect_playing = True
+                self._schedule_youtube_resume()
+                return
             if used_cached_url and not _fresh_retry:
                 logger.warning(
                     "Track %s would not open with the prefetched URL — re-resolving",
@@ -921,6 +968,10 @@ class MusicPlayer:
 
         self._play_started_at = time.monotonic()
         self._progress_changed_at = time.monotonic()
+        if track.get("source") == "youtube" and media_url:
+            self._youtube_hold_url = media_url
+            self._youtube_hold_track_id = track.get("id")
+            self._youtube_hold_saved_at = time.monotonic()
         if warmed:
             logger.info("Playing track %s (buffer ready)", self.current_track_id)
         else:
@@ -1158,10 +1209,20 @@ class MusicPlayer:
             if self._get_cached_url(track):
                 logger.info("Next track %s already prefetched", track.get("id"))
                 return
+            if self._youtube_bot_blocked():
+                self._schedule_youtube_resume()
+                return
             if self._resolve_backoff_active(track):
                 return
             logger.info("Prefetching next track %s", track.get("id"))
-            url = await self._get_media_url(track, use_cache=False)
+            try:
+                url = await self._get_media_url(track, use_cache=False)
+            except YoutubeResolveBlocked:
+                logger.warning(
+                    "Prefetch deferred — YouTube bot-check; current track keeps playing"
+                )
+                self._schedule_youtube_resume()
+                return
             if url:
                 self._put_cached_url(track, url)
                 logger.info("Prefetched next track %s", track.get("id"))
@@ -1175,6 +1236,9 @@ class MusicPlayer:
     async def ensure_next_prefetched(self) -> None:
         """Call periodically near end-of-track to make sure next URL is ready."""
         if not self.player or not self._expect_playing or self._ad_playing:
+            return
+        if self._youtube_bot_blocked():
+            self._schedule_youtube_resume()
             return
         if not self.current_playlist:
             return
@@ -1236,6 +1300,21 @@ class MusicPlayer:
             return False
 
         stalled_states = {vlc.State.Ended, vlc.State.Error} if vlc else set()
+        if (
+            vlc
+            and self._youtube_bot_blocked()
+            and state in (
+                vlc.State.Ended,
+                vlc.State.Error,
+                vlc.State.Stopped,
+                vlc.State.NothingSpecial,
+            )
+        ):
+            # The track-end path already kept or replayed audio. Walking next()
+            # here would skip the playlist while every resolve is refused.
+            self._stall_since = None
+            self._schedule_youtube_resume()
+            return False
         if state in stalled_states:
             now = time.time()
             if self._stall_since is None:
@@ -1805,12 +1884,16 @@ class MusicPlayer:
         # CRITICAL: yt-dlp is pure-Python and holds the GIL. asyncio.to_thread is NOT
         # enough — it freezes heartbeats/WS pings/commands on the Pi for minutes.
         # Run extraction in a separate *process* via the yt-dlp CLI instead.
+        if self._youtube_bot_blocked():
+            raise YoutubeResolveBlocked()
         logger.info("Resolving YouTube URL via subprocess: %s", youtube_url)
         try:
             return await asyncio.wait_for(
                 self._extract_youtube_url_subprocess(youtube_url),
                 timeout=60.0,
             )
+        except YoutubeResolveBlocked:
+            raise
         except asyncio.TimeoutError:
             logger.error("yt-dlp subprocess timed out for %s", youtube_url)
             return None
@@ -1822,13 +1905,7 @@ class MusicPlayer:
         import sys
 
         if self._youtube_bot_blocked():
-            remaining = self._youtube_blocked_until - time.monotonic()
-            logger.warning(
-                "Skipping yt-dlp for %s — YouTube bot-check cooldown (%.0fs left)",
-                youtube_url,
-                remaining,
-            )
-            return None
+            raise YoutubeResolveBlocked()
 
         cmd = [
             sys.executable,
@@ -1878,9 +1955,10 @@ class MusicPlayer:
             if self._is_youtube_bot_error(err):
                 self._youtube_blocked_until = time.monotonic() + self.YOUTUBE_BOT_COOLDOWN_S
                 logger.error(
-                    "YouTube bot-check — pausing resolves for %.0fs so skip-storms cannot deepen the flag",
+                    "YouTube bot-check — pausing new resolves for %.0fs; playback continues on cached audio",
                     self.YOUTUBE_BOT_COOLDOWN_S,
                 )
+                raise YoutubeResolveBlocked()
             return None
         lines = (stdout or b"").decode(errors="replace").strip().splitlines()
         for line in lines:
@@ -1896,3 +1974,159 @@ class MusicPlayer:
     def _is_youtube_bot_error(err: str) -> bool:
         lowered = err.lower()
         return "not a bot" in lowered or "sign in to confirm" in lowered
+
+    def _schedule_youtube_resume(self) -> None:
+        if self._youtube_resume_task and not self._youtube_resume_task.done():
+            return
+        loop = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = self._event_loop
+        if loop is None or not loop.is_running():
+            return
+        self._youtube_resume_task = loop.create_task(self._resume_after_youtube_block())
+
+    def _vlc_reports_playing(self) -> bool:
+        if not self.player or not vlc:
+            return False
+        try:
+            return self.player.get_state() in (
+                vlc.State.Playing,
+                vlc.State.Buffering,
+                vlc.State.Opening,
+            )
+        except Exception:
+            return False
+
+    def _usable_youtube_hold_url(self) -> Optional[str]:
+        if not self._youtube_hold_url:
+            return None
+        age = time.monotonic() - self._youtube_hold_saved_at
+        if age > self.YOUTUBE_HOLD_URL_MAX_AGE_S:
+            return None
+        return self._youtube_hold_url
+
+    def _index_of_track_id(self, track_id: Any) -> Optional[int]:
+        if track_id is None:
+            return None
+        for idx, track in enumerate(self.current_playlist):
+            if str(track.get("id")) == str(track_id):
+                return idx
+        return None
+
+    def _find_index_playable_offline(self, failed_index: int) -> Optional[int]:
+        """Next playlist entry that can start without a new YouTube resolve."""
+        count = len(self.current_playlist)
+        if count <= 1:
+            return None
+        for offset in range(1, count):
+            idx = (failed_index + offset) % count
+            track = self.current_playlist[idx]
+            source = track.get("source")
+            if self._get_cached_url(track):
+                return idx
+            if source == "local":
+                return idx
+            if source not in (None, "youtube") and track.get("source_url"):
+                return idx
+        return None
+
+    async def _continue_through_youtube_block(self) -> None:
+        """Keep the branch audible while YouTube refuses new stream URLs.
+
+        Called with the play lock already held. Does not clear _expect_playing:
+        that flag is what left the store silent until someone pressed play.
+        """
+        failed_index = self.current_index
+        fallback = self._find_index_playable_offline(failed_index)
+        if fallback is not None:
+            track = self.current_playlist[fallback]
+            logger.warning(
+                "YouTube bot-check — playing track %s without a new resolve",
+                track.get("id"),
+            )
+            self.current_index = fallback
+            self._schedule_youtube_resume()
+            await self._play_current_track_locked(_youtube_hold=True)
+            return
+
+        hold_url = self._usable_youtube_hold_url()
+        hold_index = self._index_of_track_id(self._youtube_hold_track_id) if hold_url else None
+        if hold_url and hold_index is not None:
+            logger.warning(
+                "YouTube bot-check — replaying track %s until resolves work again",
+                self._youtube_hold_track_id,
+            )
+            self.current_index = hold_index
+            self._schedule_youtube_resume()
+            await self._play_current_track_locked(
+                _youtube_hold=True,
+                media_url_override=hold_url,
+            )
+            return
+
+        remaining = max(0.0, self._youtube_blocked_until - time.monotonic())
+        logger.warning(
+            "YouTube bot-check — no cached audio to play; retrying when cooldown ends (%.0fs)",
+            remaining,
+        )
+        self._expect_playing = True
+        self._schedule_youtube_resume()
+
+    async def _resume_after_youtube_block(self) -> None:
+        """After the cooldown, resolve again and start audio if the branch is silent."""
+        try:
+            while True:
+                while self._youtube_bot_blocked():
+                    remaining = self._youtube_blocked_until - time.monotonic()
+                    await asyncio.sleep(min(30.0, max(1.0, remaining)))
+                if not self.current_playlist or not self._expect_playing or self._ad_playing:
+                    return
+                playing = self._vlc_reports_playing()
+                if playing:
+                    await self._wait_until_prefetch_point()
+                    if not self._expect_playing or self._ad_playing:
+                        return
+                    if self._youtube_bot_blocked():
+                        continue
+                    idx = self._next_track_index()
+                else:
+                    idx = self.current_index
+                if idx is None:
+                    return
+                track = self.current_playlist[idx]
+                if self._get_cached_url(track):
+                    if not playing and not self._vlc_reports_playing():
+                        self.current_index = idx
+                        await self._play_current_track()
+                    return
+                logger.info(
+                    "YouTube cooldown ended — resolving track %s",
+                    track.get("id"),
+                )
+                try:
+                    url = await self._get_media_url(track, use_cache=False)
+                except YoutubeResolveBlocked:
+                    logger.warning(
+                        "YouTube still blocking resolves — keeping current audio"
+                    )
+                    continue
+                if not url:
+                    self._mark_resolve_failed(track)
+                    return
+                self._put_cached_url(track, url)
+                logger.info(
+                    "YouTube resolves resumed — track %s is ready",
+                    track.get("id"),
+                )
+                if not self._vlc_reports_playing():
+                    self.current_index = idx
+                    await self._play_current_track()
+                    if self._youtube_bot_blocked() and not self._vlc_reports_playing():
+                        continue
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("YouTube resume probe failed: %s", exc)
