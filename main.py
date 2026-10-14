@@ -6,7 +6,9 @@ import threading
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from agent import Agent, AgentConfig, DeviceConfig, ServerClient
+from agent import Agent, AgentConfig, DeviceConfig, ServerClient, agent_version
+
+_config_write_lock = threading.Lock()
 
 
 def configure_logging() -> None:
@@ -70,6 +72,27 @@ def persist_device_token(
     api_url: str,
     ws_url: str,
 ) -> None:
+    with _config_write_lock:
+        _persist_device_token_unlocked(
+            config_path,
+            device,
+            token,
+            resolved_device_id,
+            resolved_branch_id,
+            api_url,
+            ws_url,
+        )
+
+
+def _persist_device_token_unlocked(
+    config_path: Path,
+    device: DeviceConfig,
+    token: str,
+    resolved_device_id: str,
+    resolved_branch_id: int,
+    api_url: str,
+    ws_url: str,
+) -> None:
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
         devices_data = data.get("devices", [])
@@ -108,6 +131,16 @@ def persist_device_token(
 
 
 def persist_device_entry(
+    config_path: Path,
+    device: DeviceConfig,
+    api_url: str,
+    ws_url: str,
+) -> None:
+    with _config_write_lock:
+        _persist_device_entry_unlocked(config_path, device, api_url, ws_url)
+
+
+def _persist_device_entry_unlocked(
     config_path: Path,
     device: DeviceConfig,
     api_url: str,
@@ -173,6 +206,14 @@ async def register_device_with_retry(
             resolved_device_id = str(response.get("device_id") or device.device_id or "").strip()
             resolved_branch_id = int(response.get("branch_id") or device.branch_id or 0)
             return str(token).strip(), resolved_device_id, resolved_branch_id
+        if status == "claimed":
+            logging.warning(
+                "Device token for hardware_id=%s was already issued. "
+                "Approve the device again to issue a new one.",
+                resolved_hardware_id,
+            )
+            await asyncio.sleep(30)
+            continue
         logging.warning("Device registration returned no token. Retrying in 30s.")
         await asyncio.sleep(30)
 
@@ -181,9 +222,53 @@ def run_device(agent_config: AgentConfig, device: DeviceConfig) -> None:
     asyncio.run(Agent(agent_config, device).start())
 
 
+def run_device_thread(
+    agent_config: AgentConfig,
+    device: DeviceConfig,
+    config_path: Path,
+    hardware_id: str,
+) -> None:
+    """Register this device if needed, then run it.
+
+    Each device has its own thread so one device stuck on admin approval
+    does not keep the others from starting.
+    """
+    if not device.device_token:
+        logging.info(
+            "No device_token for device_id=%s, attempting registration",
+            device.device_id or device.device_name or device.branch_id,
+        )
+        registration = asyncio.run(
+            register_device_with_retry(agent_config.api_url, device, hardware_id)
+        )
+        if not registration:
+            logging.error(
+                "Registration ended without a token for device_id=%s",
+                device.device_id or device.device_name or device.branch_id,
+            )
+            return
+        device_token, resolved_device_id, resolved_branch_id = registration
+        persist_device_token(
+            config_path,
+            device,
+            device_token,
+            resolved_device_id,
+            resolved_branch_id,
+            agent_config.api_url,
+            agent_config.ws_url,
+        )
+        device = DeviceConfig(
+            device_id=resolved_device_id or device.device_id,
+            device_name=device.device_name,
+            branch_id=resolved_branch_id or device.branch_id,
+            device_token=device_token,
+        )
+    run_device(agent_config, device)
+
+
 def main() -> None:
     configure_logging()
-    print("--- Version 2.0.0 ---")
+    print(f"--- Version {agent_version()} ---")
     base_dir = Path(__file__).resolve().parent
     candidate_paths = [
         base_dir / "config.json",
@@ -219,48 +304,11 @@ def main() -> None:
         config = AgentConfig(api_url=config.api_url, ws_url=config.ws_url, devices=[default_device])
         logging.info("Initialized config with device_name=%s", device_name)
 
-    updated_devices: List[DeviceConfig] = []
-    for device in config.devices:
-        device_token = device.device_token
-        if not device_token:
-            logging.info(
-                "No device_token for device_id=%s, attempting registration",
-                device.device_id or device.device_name or device.branch_id,
-            )
-            registration = asyncio.run(register_device_with_retry(config.api_url, device, hardware_id))
-            if registration:
-                device_token, resolved_device_id, resolved_branch_id = registration
-                persist_device_token(
-                    config_path,
-                    device,
-                    device_token,
-                    resolved_device_id,
-                    resolved_branch_id,
-                    config.api_url,
-                    config.ws_url,
-                )
-                device = DeviceConfig(
-                    device_id=resolved_device_id or device.device_id,
-                    device_name=device.device_name,
-                    branch_id=resolved_branch_id or device.branch_id,
-                    device_token=device_token,
-                )
-        updated_devices.append(
-            DeviceConfig(
-                device_id=device.device_id,
-                device_name=device.device_name,
-                branch_id=device.branch_id,
-                device_token=device_token,
-            )
-        )
-
-    config = AgentConfig(api_url=config.api_url, ws_url=config.ws_url, devices=updated_devices)
-
     threads: List[threading.Thread] = []
     for device in config.devices:
         thread = threading.Thread(
-            target=run_device,
-            args=(config, device),
+            target=run_device_thread,
+            args=(config, device, config_path, hardware_id),
             name=f"agent-{device.device_id or device.device_name or device.branch_id}",
             daemon=True,
         )

@@ -248,6 +248,40 @@ sudo systemctl enable --now music-agent-nightly-reboot.timer
 echo "Nightly reboot timer enabled (local midnight)."
 systemctl list-timers music-agent-nightly-reboot.timer --no-pager 2>/dev/null || true
 
+echo "Configuring weekly yt-dlp update..."
+YTDLP_SERVICE="/etc/systemd/system/music-agent-ytdlp-update.service"
+YTDLP_TIMER="/etc/systemd/system/music-agent-ytdlp-update.timer"
+
+sudo tee "$YTDLP_SERVICE" > /dev/null <<EOF
+[Unit]
+Description=Weekly yt-dlp update for Neeman Music Agent
+
+[Service]
+Type=oneshot
+User=${SERVICE_USER}
+WorkingDirectory=${SCRIPT_DIR}
+ExecStart=${SCRIPT_DIR}/.venv/bin/pip install -U yt-dlp[default]
+EOF
+
+sudo tee "$YTDLP_TIMER" > /dev/null <<'EOF'
+[Unit]
+Description=Update yt-dlp every week
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=1h
+Unit=music-agent-ytdlp-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now music-agent-ytdlp-update.timer
+echo "Weekly yt-dlp update timer enabled (Sunday 04:30, with up to an hour of delay)."
+systemctl list-timers music-agent-ytdlp-update.timer --no-pager 2>/dev/null || true
+
 echo "Running quick health checks..."
 python3 -V
 ${PYTHON_BIN} -c "import httpx, websockets; print('python deps: ok')"

@@ -58,7 +58,6 @@ rsync -avz --delete \
   --exclude '.venv/' \
   --exclude '__pycache__/' \
   --exclude '*.pyc' \
-  --exclude '.git/' \
   --exclude 'config.json' \
   --exclude '.env' \
   --exclude '*.log' \

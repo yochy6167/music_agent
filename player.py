@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import platform
@@ -6,6 +7,7 @@ import random
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -49,6 +51,9 @@ class MusicPlayer:
     SEEK_REBUFFER_S = 1.2
     # Extra silence after un-pausing, covering the audio output restart.
     SEEK_RESUME_MUTE_S = 0.3
+    # A nightly reboot should resume. A Pi that was off for hours should not
+    # start playing on its own outside the schedule window.
+    RESUME_MAX_AGE_S = 6 * 60 * 60
 
     def __init__(self, api_url: str, device_token: str) -> None:
         self.api_url = api_url.rstrip("/")
@@ -118,6 +123,72 @@ class MusicPlayer:
 
         self._init_vlc()
 
+    def _playback_state_path(self) -> Path:
+        return self.cache_dir.parent / "playback_state.json"
+
+    def _persist_playback_state(self) -> None:
+        payload = {
+            "playlist_id": self.current_playlist_id,
+            "track_id": self.current_track_id,
+            "repeat_mode": self.repeat_mode,
+            "shuffle": self._shuffle_enabled(),
+            "volume": self.volume,
+            "expect_playing": bool(self._expect_playing),
+            "saved_at": time.time(),
+        }
+        path = self._playback_state_path()
+        tmp = Path(str(path) + ".part")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning("Could not save playback state: %s", exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def _load_playback_state(self) -> Optional[dict]:
+        try:
+            data = json.loads(self._playback_state_path().read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def restore_saved_volume(self) -> None:
+        """Restore the dashboard volume only. Never starts playback."""
+        state = self._load_playback_state()
+        if not state or state.get("volume") is None:
+            return
+        try:
+            self.volume = float(state["volume"])
+        except (TypeError, ValueError):
+            return
+
+    def saved_resume_hint(self, playlist_id: int) -> Optional[int]:
+        """Track to continue after the server has authorized this playlist.
+
+        The hint is not permission to play. A Shabbat boot must stay silent
+        unless the server says a schedule is on.
+        """
+        state = self._load_playback_state()
+        if not state or not state.get("expect_playing"):
+            return None
+        if str(state.get("playlist_id")) != str(playlist_id):
+            return None
+        try:
+            saved_at = float(state.get("saved_at") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not saved_at or time.time() - saved_at > self.RESUME_MAX_AGE_S:
+            return None
+        track_id = state.get("track_id")
+        try:
+            return int(track_id) if track_id is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def _shuffle_enabled(self) -> bool:
         return bool(self.shuffle) or self.repeat_mode == "shuffle"
 
@@ -146,6 +217,7 @@ class MusicPlayer:
         elif previous and not now_shuffle:
             self._restore_original_order(keep_track_id=current_id)
             logger.info("Shuffle disabled — restored playlist order")
+        self._persist_playback_state()
 
     def set_repeat_mode(self, mode: Optional[str]) -> None:
         """Update loop/repeat mode. Legacy 'shuffle' maps to shuffle+repeat_all."""
@@ -158,6 +230,7 @@ class MusicPlayer:
             self.repeat_mode = "repeat_all"
             if not was_shuffle or was_legacy:
                 logger.info("Legacy repeat_mode=shuffle → shuffle on + repeat_all")
+            self._persist_playback_state()
             return
         mode = str(mode)
         if mode == self.repeat_mode:
@@ -168,6 +241,7 @@ class MusicPlayer:
             mode,
             self._shuffle_enabled(),
         )
+        self._persist_playback_state()
 
     def _reshuffle_playlist(self, keep_track_id=None, avoid_first_id=None) -> None:
         """Fisher-Yates shuffle of the canonical playlist. No song repeats in a cycle."""
@@ -311,7 +385,8 @@ class MusicPlayer:
         if self.player and not (self._ad_playing and self._ad_overlay_mode == "fade_pause"):
             self._apply_intended_volume(int(self.volume))
         if self.ad_player and self._ad_playing:
-            self._force_ad_player_volume(max(int(self.volume), 80))
+            self._force_ad_player_volume(int(self.volume))
+        self._persist_playback_state()
 
     def _vlc_software_volume(self) -> Optional[int]:
         """What libvlc is actually mixing, not the dashboard-facing self.volume."""
@@ -478,6 +553,7 @@ class MusicPlayer:
                 getattr(state, "name", state),
             )
             self._expect_playing = True
+            self._persist_playback_state()
             return
 
         if same_track and vlc and state == vlc.State.Paused:
@@ -488,6 +564,7 @@ class MusicPlayer:
             self._progress_position_ms = -1
             self._progress_changed_at = time.monotonic()
             self._play_started_at = time.monotonic()
+            self._persist_playback_state()
             return
 
         # Grace window: even if state flickers to Stopped for a moment, don't restart.
@@ -522,14 +599,17 @@ class MusicPlayer:
             logger.info("Already paused — ignoring duplicate pause")
             self._expect_playing = False
             self._stall_since = None
+            self._persist_playback_state()
             return
         if vlc and state in (vlc.State.Stopped, vlc.State.Ended, vlc.State.Error):
             self._expect_playing = False
             self._stall_since = None
+            self._persist_playback_state()
             return
         self.player.set_pause(True)
         self._expect_playing = False
         self._stall_since = None
+        self._persist_playback_state()
         logger.info("Paused playback")
 
     async def stop(self) -> None:
@@ -537,6 +617,7 @@ class MusicPlayer:
             self.player.stop()
             self._expect_playing = False
             self._stall_since = None
+            self._persist_playback_state()
 
     async def next(self) -> None:
         if not self.current_playlist:
@@ -820,6 +901,7 @@ class MusicPlayer:
                 _skip_depth,
             )
             self._expect_playing = False
+            self._persist_playback_state()
             return
 
         track = self.current_playlist[self.current_index]
@@ -893,6 +975,7 @@ class MusicPlayer:
         self.current_track_id = track.get("id")
         self.current_track = track
         self._expect_playing = True
+        self._persist_playback_state()
         self._stall_since = None
         self._play_started_at = time.monotonic()
         self._last_known_position_s = 0.0
@@ -1480,30 +1563,81 @@ class MusicPlayer:
             return f"{self.api_url}{url}"
         return f"{self.api_url}/{url.lstrip('/')}"
 
+    def _is_own_api_url(self, url: str) -> bool:
+        try:
+            target = urlparse(url)
+            api = urlparse(self.api_url)
+        except Exception:
+            return False
+        return (
+            target.scheme in {"http", "https"}
+            and bool(target.hostname)
+            and target.hostname.lower() == (api.hostname or "").lower()
+        )
+
+    def _cache_is_complete(self, path: Path) -> bool:
+        marker = Path(str(path) + ".complete")
+        try:
+            return path.is_file() and path.stat().st_size > 0 and marker.is_file()
+        except OSError:
+            return False
+
     async def _download_to_cache(
         self, cache_key: int, url: str, dst: Path, timeout: float = 15.0
     ) -> bool:
+        # Short timeout: ad downloads run inline with playback decisions, so we'd
+        # rather fail fast and fall back to streaming than freeze for a long time.
+        part = Path(str(dst) + ".part")
+        marker = Path(str(dst) + ".complete")
         try:
-            headers = {"X-Device-Token": self.device_token}
-            # Short timeout: ad downloads run inline with playback decisions, so we'd
-            # rather fail fast and fall back to streaming than freeze for a long time.
             client_timeout = httpx.Timeout(timeout, connect=5.0)
-            async with httpx.AsyncClient(timeout=client_timeout, follow_redirects=True) as client:
-                async with client.stream("GET", url, headers=headers) as response:
-                    response.raise_for_status()
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    with dst.open("wb") as handle:
-                        async for chunk in response.aiter_bytes():
-                            handle.write(chunk)
-            return dst.is_file() and dst.stat().st_size > 0
+            current = url
+            async with httpx.AsyncClient(timeout=client_timeout, follow_redirects=False) as client:
+                for _hop in range(5):
+                    # The device token authenticates our API only. A redirect, or an
+                    # ad file hosted elsewhere, must not receive it.
+                    headers = (
+                        {"X-Device-Token": self.device_token}
+                        if self.device_token and self._is_own_api_url(current)
+                        else {}
+                    )
+                    async with client.stream("GET", current, headers=headers) as response:
+                        if response.status_code in {301, 302, 303, 307, 308}:
+                            location = response.headers.get("location")
+                            if not location:
+                                raise httpx.HTTPError("redirect without location")
+                            current = urljoin(current, location)
+                            continue
+                        response.raise_for_status()
+                        expected = response.headers.get("content-length")
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        written = 0
+                        with part.open("wb") as handle:
+                            async for chunk in response.aiter_bytes():
+                                handle.write(chunk)
+                                written += len(chunk)
+                        if expected and expected.isdigit() and written != int(expected):
+                            raise httpx.HTTPError(
+                                f"short download ({written} of {expected} bytes)"
+                            )
+                        if written <= 0:
+                            raise httpx.HTTPError("empty download")
+                        os.replace(part, dst)
+                        marker.write_text("ok", encoding="utf-8")
+                        return True
+                raise httpx.HTTPError("too many redirects")
         except Exception as exc:
             logger.error("Ad cache download failed for %s: %s", cache_key, exc)
+            try:
+                part.unlink()
+            except OSError:
+                pass
             return False
 
     async def _resolve_ad_play_url(self, url: str, cache_key: int) -> Optional[str]:
         abs_url = self._absolutize_url(url)
         cache_path = self.cache_dir / f"ad_{cache_key}{self.CACHE_EXT}"
-        if cache_path.is_file() and cache_path.stat().st_size > 0:
+        if self._cache_is_complete(cache_path):
             return str(cache_path)
         if await self._download_to_cache(cache_key, abs_url, cache_path):
             return str(cache_path)
@@ -1716,9 +1850,10 @@ class MusicPlayer:
                         schedule_config=schedule_config,
                     )
                     return False
-                self._force_ad_player_volume(100)
+                ad_volume = int(self.volume)
+                self._force_ad_player_volume(ad_volume)
                 await asyncio.sleep(0.15)
-                self._force_ad_player_volume(100)
+                self._force_ad_player_volume(ad_volume)
                 logger.info("Playing ad campaign %s on overlay player", campaign_id)
                 self._start_ad_watchdog(campaign_id)
                 return True
