@@ -14,6 +14,21 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+def _kill_process_tree(proc: "asyncio.subprocess.Process") -> None:
+    """Kill a subprocess and everything it started (its own session on POSIX)."""
+    if proc.returncode is not None:
+        return
+    try:
+        if os.name == "posix":
+            import signal
+
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
 class YoutubeResolveBlocked(Exception):
     """YouTube refused a new stream URL, or a bot-check cooldown is still active."""
 
@@ -107,6 +122,15 @@ class MusicPlayer:
         self._play_started_at: float = 0.0
         self._last_known_position_s: float = 0.0
         self._play_lock = asyncio.Lock()
+        # Bumped by every user command that sets what should be playing (play,
+        # pause, stop, next, previous). A track start, an auto-advance or a
+        # watchdog restart records it when it begins and gives up as soon as it
+        # changes, so a stop or pause can never be undone by a start that was
+        # already resolving a YouTube URL when the user pressed it.
+        self._intent: int = 0
+        # True while a fresh track plays muted to fill its buffer; a volume
+        # change then only records the level, applied when the warmup ends.
+        self._warming_up = False
         self._progress_position_ms: int = -1
         self._progress_changed_at: float = time.monotonic()
         self._seeked_at: float = 0.0
@@ -382,7 +406,11 @@ class MusicPlayer:
 
     async def set_volume(self, volume: float) -> None:
         self.volume = float(volume)
-        if self.player and not (self._ad_playing and self._ad_overlay_mode == "fade_pause"):
+        if self._ad_playing:
+            # The music is ducked or paused under the ad: change the level it
+            # returns to afterwards, not the music now (that undid the duck).
+            self._ad_pre_music_volume = int(self.volume)
+        elif self.player and not self._warming_up:
             self._apply_intended_volume(int(self.volume))
         if self.ad_player and self._ad_playing:
             self._force_ad_player_volume(int(self.volume))
@@ -493,7 +521,28 @@ class MusicPlayer:
         if self._ad_playing:
             logger.info("Ignoring play() — ad is currently playing")
             return
+        self._intent += 1
         self._ensure_music_audible()
+
+        switching = bool(playlist_id) and (playlist_id != self.current_playlist_id or not self.current_playlist)
+
+        # Resume a paused track before anything else: a play after pause carries
+        # the branch's shuffle flag, and reshuffling here jumped to a random song.
+        if not switching and track_id is None:
+            try:
+                paused = bool(vlc) and self.player.get_state() == vlc.State.Paused
+            except Exception:
+                paused = False
+            if paused and self.current_track_id is not None:
+                logger.info("Resuming paused track %s", self.current_track_id)
+                self.player.set_pause(False)
+                self._expect_playing = True
+                self._stall_since = None
+                self._progress_position_ms = -1
+                self._progress_changed_at = time.monotonic()
+                self._play_started_at = time.monotonic()
+                self._persist_playback_state()
+                return
 
         if shuffle is True:
             self.set_shuffle(True)
@@ -502,8 +551,18 @@ class MusicPlayer:
         if shuffle is True and track_id is None:
             restart_shuffled = True
 
-        if playlist_id and (playlist_id != self.current_playlist_id or not self.current_playlist):
-            await self._load_playlist(int(playlist_id))
+        previous_state = (
+            self.current_playlist_id,
+            self.current_playlist,
+            self._original_playlist,
+            self.current_index,
+        )
+        if switching:
+            if not await self._load_playlist(int(playlist_id)):
+                # Keep what is playing (and the list it auto-advances through)
+                # rather than going quiet with an empty playlist.
+                logger.error("Could not switch to playlist %s — keeping the current one", playlist_id)
+                return
 
         if not self.current_playlist:
             logger.error("No playlist loaded")
@@ -584,11 +643,32 @@ class MusicPlayer:
             return
 
         self._expect_playing = True
-        await self._play_current_track()
+        try:
+            await self._play_current_track()
+        finally:
+            # The switch never got as far as a track of the new playlist (a newer
+            # command took over, or this one timed out): the old track is still
+            # what VLC holds, so keep reporting the playlist it belongs to.
+            if switching and str(self.current_playlist_id) == str(playlist_id) and not any(
+                str(t.get("id")) == str(self.current_track_id) for t in self.current_playlist
+            ):
+                (
+                    self.current_playlist_id,
+                    self.current_playlist,
+                    self._original_playlist,
+                    self.current_index,
+                ) = previous_state
+                logger.info("Switch to playlist %s did not start; still on %s", playlist_id, self.current_playlist_id)
+
+    def supersede_pending_start(self) -> None:
+        """A user command just arrived (it may still wait in a queue): a track
+        start that is still resolving gives way instead of playing first."""
+        self._intent += 1
 
     async def pause(self) -> None:
         if not self.player:
             return
+        self._intent += 1
         try:
             state = self.player.get_state()
         except Exception:
@@ -613,32 +693,43 @@ class MusicPlayer:
         logger.info("Paused playback")
 
     async def stop(self) -> None:
+        self._intent += 1
         if self.player:
             self.player.stop()
             self._expect_playing = False
             self._stall_since = None
             self._persist_playback_state()
 
-    async def next(self) -> None:
+    async def next(self, steps: int = 1, *, user: bool = False, epoch: Optional[int] = None) -> None:
+        """Advance ``steps`` tracks. ``user``: a dashboard command (a new intent).
+        Otherwise (auto-advance, watchdog) pass the ``epoch`` the caller started
+        under; if a user command came in since, this advance is dropped."""
+        if user:
+            self._intent += 1
+        elif epoch is not None and epoch != self._intent:
+            logger.info("Auto-advance dropped — a newer command took over")
+            return
         if not self.current_playlist:
             return
-        at_end = self.current_index >= len(self.current_playlist) - 1
-        if at_end and self._shuffle_enabled():
-            last_id = self.current_playlist[self.current_index].get("id")
-            self._reshuffle_playlist(avoid_first_id=last_id)
-            self.current_index = 0
-            logger.info("Reshuffled playlist for a new cycle")
-        else:
-            self.current_index = (self.current_index + 1) % len(self.current_playlist)
+        for _ in range(max(1, int(steps))):
+            at_end = self.current_index >= len(self.current_playlist) - 1
+            if at_end and self._shuffle_enabled():
+                last_id = self.current_playlist[self.current_index].get("id")
+                self._reshuffle_playlist(avoid_first_id=last_id)
+                self.current_index = 0
+                logger.info("Reshuffled playlist for a new cycle")
+            else:
+                self.current_index = (self.current_index + 1) % len(self.current_playlist)
         self._expect_playing = True
-        await self._play_current_track()
+        await self._play_current_track(epoch=self._intent)
 
-    async def previous(self) -> None:
+    async def previous(self, steps: int = 1) -> None:
+        self._intent += 1
         if not self.current_playlist:
             return
-        self.current_index = (self.current_index - 1) % len(self.current_playlist)
+        self.current_index = (self.current_index - max(1, int(steps))) % len(self.current_playlist)
         self._expect_playing = True
-        await self._play_current_track()
+        await self._play_current_track(epoch=self._intent)
 
     async def seek(self, position_seconds: float) -> None:
         if not self.player:
@@ -689,8 +780,9 @@ class MusicPlayer:
                 # muted across it keeps that inside the one intentional gap
                 # instead of surfacing as a second glitch after audio resumed.
                 await asyncio.sleep(self.SEEK_RESUME_MUTE_S)
-                restore = resume_volume if resume_volume and resume_volume > 0 else int(self.volume)
-                self._apply_intended_volume(restore)
+                # The dashboard level now, not the one captured before the wait:
+                # a volume change during the seek used to be reverted here.
+                self._apply_intended_volume(int(self.volume))
             except Exception:
                 pass
             self._seeked_at = time.monotonic()
@@ -767,13 +859,12 @@ class MusicPlayer:
             "ad_campaign_name": self._ad_campaign_name if self._ad_playing else None,
         }
 
-    async def _load_playlist(self, playlist_id: int) -> None:
+    async def _load_playlist(self, playlist_id: int) -> bool:
+        """Fetch and switch to a playlist. On failure nothing changes (returns False)."""
         playlist_data = await self._fetch_playlist(playlist_id)
-        if not playlist_data:
+        if not playlist_data or not playlist_data.get("items"):
             logger.error("Failed to load playlist %s", playlist_id)
-            self.current_playlist = []
-            self._original_playlist = []
-            return
+            return False
 
         items = playlist_data.get("items", [])
         self._original_playlist = list(items)
@@ -785,6 +876,7 @@ class MusicPlayer:
             self.current_playlist = items
             self.current_index = 0
         logger.info("Loaded playlist %s (%d items)", playlist_id, len(items))
+        return True
 
     async def reload_playlist(self, playlist_id: Optional[int] = None) -> bool:
         """Re-fetch the loaded playlist without interrupting what is playing.
@@ -857,14 +949,19 @@ class MusicPlayer:
     async def _fetch_playlist(self, playlist_id: int) -> Optional[Dict[str, Any]]:
         url = f"{self.api_url}/api/v1/playlists/{playlist_id}"
         headers = {"X-Device-Token": self.device_token}
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(url, headers=headers)
-                response.raise_for_status()
-                return response.json()
-        except httpx.HTTPError as exc:
-            logger.error("Playlist fetch failed: %s", exc)
-            return None
+        # A busy server or a slow line used to cost the whole switch; one retry
+        # with a longer timeout rides out a blip.
+        for attempt in (1, 2):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(url, headers=headers)
+                    response.raise_for_status()
+                    return response.json()
+            except httpx.HTTPError as exc:
+                logger.error("Playlist fetch failed (attempt %s): %s", attempt, exc)
+                if attempt == 1:
+                    await asyncio.sleep(1.0)
+        return None
 
     def _set_index_for_track(self, track_id: Any) -> None:
         for idx, track in enumerate(self.current_playlist):
@@ -874,15 +971,21 @@ class MusicPlayer:
                 return
         logger.warning("Track %s not found in playlist", track_id)
 
-    async def _play_current_track(self, *, _skip_depth: int = 0) -> None:
+    async def _play_current_track(self, *, _skip_depth: int = 0, epoch: Optional[int] = None) -> None:
         """Serialised entry point for starting a track.
 
         Auto-advance runs from the VLC end-of-track event while dashboard commands
         run on the command worker, so two callers can reach this concurrently. Two
         overlapping set_media()/play() calls on one media player leave VLC wedged,
         so the whole start sequence is guarded by a lock.
+
+        ``epoch``: the intent the caller acted on. A start that waited for the lock
+        while the user stopped, paused or picked something else is dropped.
         """
         async with self._play_lock:
+            if epoch is not None and epoch != self._intent:
+                logger.info("Track start dropped — a newer command took over")
+                return
             await self._play_current_track_locked(_skip_depth=_skip_depth)
 
     async def _play_current_track_locked(
@@ -895,6 +998,7 @@ class MusicPlayer:
     ) -> None:
         if not self.current_playlist or not self.player:
             return
+        epoch = self._intent
         if _skip_depth >= min(len(self.current_playlist), 12):
             logger.error(
                 "Too many unplayable tracks in a row (%s); stopping auto-advance",
@@ -927,6 +1031,12 @@ class MusicPlayer:
                     self._put_cached_url(track, media_url)
                 elif not blocked:
                     self._mark_resolve_failed(track)
+
+        # Resolving can take a minute. A stop/pause/new play that arrived meanwhile
+        # wins: starting this track now would undo it.
+        if epoch != self._intent:
+            logger.info("Start of track %s dropped — a newer command arrived while resolving", track.get("id"))
+            return
 
         if not media_url:
             youtube_track = track.get("source") == "youtube"
@@ -963,7 +1073,7 @@ class MusicPlayer:
                 pass
 
         # Mute while VLC fills the network buffer, so a rough start is inaudible.
-        target_vol = int(self.volume)
+        self._warming_up = True
         try:
             self.player.audio_set_volume(0)
         except Exception:
@@ -989,6 +1099,10 @@ class MusicPlayer:
         # songs in and only came back ~10s later when the stall watchdog issued its own
         # stop(). Resetting here is what makes an unassisted transition work.
         await self._reset_player_for_new_media()
+        if epoch != self._intent:
+            self._warming_up = False
+            logger.info("Start of track %s dropped — a newer command arrived", track.get("id"))
+            return
 
         self.player.set_media(media)
         # libvlc keeps its own reference once the media is attached to the player;
@@ -1004,8 +1118,14 @@ class MusicPlayer:
         except Exception:
             pass
 
-        warmed = await self._wait_for_playback_buffer(timeout_s=8.0)
-        await self._unmute_after_warmup(target_vol)
+        try:
+            warmed = await self._wait_for_playback_buffer(timeout_s=8.0)
+        finally:
+            self._warming_up = False
+        # The level the dashboard shows now; one captured before the warmup
+        # reverted a volume change made during it.
+        if not self._ad_playing:
+            await self._unmute_after_warmup(int(self.volume))
 
         # A prefetched YouTube URL can be rejected by the time it is used (the CDN
         # link is only good for a while), and VLC then goes straight to Ended/Error
@@ -1013,7 +1133,7 @@ class MusicPlayer:
         # silently skipped and the branch stays quiet until the watchdog notices.
         # _expect_playing guards against a stop/pause that landed during warmup: that
         # leaves VLC in the same state as a failure but must not advance the playlist.
-        if self._expect_playing and self._failed_to_start():
+        if self._expect_playing and epoch == self._intent and self._failed_to_start():
             if _youtube_hold:
                 logger.warning(
                     "Track %s could not be replayed during YouTube bot-check — waiting to resolve again",
@@ -1283,7 +1403,8 @@ class MusicPlayer:
             # Let the current track finish its buffer warmup before competing for CPU.
             await asyncio.sleep(5.0)
             await self._wait_until_prefetch_point()
-            if not self.current_playlist or self._ad_playing:
+            # The wait also ends on stop/pause; resolving then is wasted CPU.
+            if not self.current_playlist or self._ad_playing or not self._expect_playing:
                 return
             nxt = self._next_track_index()
             if nxt is None:
@@ -1366,6 +1487,7 @@ class MusicPlayer:
             return False
         if not self.current_playlist:
             return False
+        epoch = self._intent
         # A start is already in flight; let it finish before judging progress.
         if self._play_lock.locked():
             self._progress_changed_at = time.monotonic()
@@ -1411,13 +1533,13 @@ class MusicPlayer:
                 now - self._stall_since,
             )
             self._stall_since = None
-            await self.next()
+            await self.next(epoch=epoch)
             return True
 
         self._stall_since = None
-        return await self._recover_if_position_frozen(state)
+        return await self._recover_if_position_frozen(state, epoch)
 
-    async def _recover_if_position_frozen(self, state: Any) -> bool:
+    async def _recover_if_position_frozen(self, state: Any, epoch: Optional[int] = None) -> bool:
         """Restart the current track if its position has stopped advancing."""
         # Don't fight the initial buffer fill — a fresh start legitimately sits at 0.
         if self._play_started_at and (time.monotonic() - self._play_started_at) < self.FROZEN_GRACE_S:
@@ -1477,9 +1599,9 @@ class MusicPlayer:
         if give_up:
             self._frozen_track_id = None
             self._frozen_restarts = 0
-            await self.next()
+            await self.next(epoch=epoch)
         else:
-            await self._play_current_track()
+            await self._play_current_track(epoch=epoch)
         return True
 
     def _on_track_end(self, event: Any) -> None:
@@ -1491,6 +1613,9 @@ class MusicPlayer:
             asyncio.run_coroutine_threadsafe(self._finish_ad_playback(completed=True), self._event_loop)
 
     async def _handle_track_end(self) -> None:
+        # What the user wanted when this track ended; a pause/stop/new play that
+        # lands while the ad check or analytics run must not be overridden.
+        epoch = self._intent
         if self._ad_playing:
             if self._ad_overlay_mode == "duck":
                 self._ad_after_finish_action = self._ad_after_finish_action or "next"
@@ -1528,9 +1653,13 @@ class MusicPlayer:
                 logger.warning("on_track_ended callback failed: %s", exc)
 
         loop = self._loop_mode()
+        if epoch != self._intent or not self._expect_playing:
+            logger.info("Track ended after a newer command — not advancing")
+            return
+
         if loop == "repeat_one":
             logger.info("Repeat mode: repeat_one - replaying current track")
-            await self._play_current_track()
+            await self._play_current_track(epoch=epoch)
             return
 
         if loop == "single":
@@ -1552,7 +1681,7 @@ class MusicPlayer:
             loop,
             self._shuffle_enabled(),
         )
-        await self.next()
+        await self.next(epoch=epoch)
 
     def _absolutize_url(self, url: str) -> str:
         if not url:
@@ -2082,8 +2211,15 @@ class MusicPlayer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            # Its own process group, so a timeout can kill yt-dlp *and* the deno
+            # it spawns; orphans kept burning the Pi's CPU after every timeout.
+            start_new_session=(os.name == "posix"),
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await proc.communicate()
+        except BaseException:
+            _kill_process_tree(proc)
+            raise
         if proc.returncode != 0:
             err = (stderr or b"").decode(errors="replace").strip()
             logger.error("yt-dlp exited %s: %s", proc.returncode, err[:500])
@@ -2211,6 +2347,7 @@ class MusicPlayer:
 
     async def _resume_after_youtube_block(self) -> None:
         """After the cooldown, resolve again and start audio if the branch is silent."""
+        epoch = self._intent
         try:
             while True:
                 while self._youtube_bot_blocked():
@@ -2234,7 +2371,7 @@ class MusicPlayer:
                 if self._get_cached_url(track):
                     if not playing and not self._vlc_reports_playing():
                         self.current_index = idx
-                        await self._play_current_track()
+                        await self._play_current_track(epoch=epoch)
                     return
                 logger.info(
                     "YouTube cooldown ended — resolving track %s",
@@ -2257,7 +2394,7 @@ class MusicPlayer:
                 )
                 if not self._vlc_reports_playing():
                     self.current_index = idx
-                    await self._play_current_track()
+                    await self._play_current_track(epoch=epoch)
                     if self._youtube_bot_blocked() and not self._vlc_reports_playing():
                         continue
                 return

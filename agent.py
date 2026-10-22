@@ -63,6 +63,13 @@ def _ws_connect_headers(headers: Dict[str, str]) -> Dict[str, Any]:
     return {key: headers}
 
 
+# A newer one of these makes queued play/next/previous/seek commands stale.
+_INTENT_ACTIONS = {"play", "pause", "stop"}
+_SUPERSEDABLE_ACTIONS = {"play", "next", "skip", "previous", "seek"}
+# Arriving, one of these makes a track start that is still resolving give way.
+_NEW_TRACK_ACTIONS = {"play", "pause", "stop", "next", "skip", "previous"}
+
+
 @dataclass(frozen=True)
 class DeviceConfig:
     device_id: str
@@ -426,6 +433,17 @@ class Agent:
         self._boot_resume_done = False
         self._suppress_resume = False
         self._resume_not_before = 0.0
+        # Order of arrival, and the newest play/pause/stop. Commands run on two
+        # workers (fast control, slow play/next), so a play queued before a stop
+        # used to run after it and leave the branch playing. A heavy command
+        # older than the newest play/pause/stop is now skipped as stale.
+        self._command_seq = 0
+        self._latest_intent_seq = 0
+        # The last queued "next" that has not started yet: further next clicks
+        # are added to it (skip N) instead of each starting a song.
+        self._pending_next: Optional[dict] = None
+        self._campaign_refresh_task: Optional[asyncio.Task] = None
+        self._ws_established_at = 0.0
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -545,6 +563,15 @@ class Agent:
                 self._last_command_tick = time.time()
                 command_type = command.get("type")
                 action = command.get("action")
+                if command is self._pending_next:
+                    self._pending_next = None
+                if self._is_superseded(command):
+                    logger.info(
+                        "Skipping stale command type=%s action=%s (a newer play/pause/stop arrived)",
+                        command_type, action,
+                    )
+                    self._command_queue.task_done()
+                    continue
                 logger.info("Handling command: type=%s action=%s", command_type, action)
 
                 timeout_s = 30.0
@@ -625,15 +652,36 @@ class Agent:
         heavy_n = 0
         ad_n = 0
         for command in filtered:
+            self._command_seq += 1
+            command["_seq"] = self._command_seq
+            action = (command.get("action") or "").lower()
+            if command.get("type") == "playback_control" and action in _INTENT_ACTIONS:
+                self._latest_intent_seq = self._command_seq
+            if command.get("type") == "playback_control" and action in _NEW_TRACK_ACTIONS:
+                # A start already resolving for an older command would otherwise
+                # play first and be replaced seconds later (two starts per click).
+                self.player.supersede_pending_start()
             if self._is_ad_command(command):
                 await self._ad_queue.put(command)
                 ad_n += 1
             elif self._is_priority_control(command):
                 await self._control_queue.put(command)
                 control_n += 1
+            elif (
+                command.get("type") == "playback_control"
+                and action in {"next", "skip"}
+                and self._pending_next is not None
+                and self._pending_next.get("_seq", 0) > self._latest_intent_seq
+            ):
+                # Another next click while the previous one is still waiting:
+                # one skip of N songs instead of N song starts in a row.
+                self._pending_next["steps"] = int(self._pending_next.get("steps") or 1) + 1
+                self._pending_next["_seq"] = command["_seq"]
             else:
                 await self._command_queue.put(command)
                 heavy_n += 1
+                if command.get("type") == "playback_control" and action in {"next", "skip"}:
+                    self._pending_next = command
         if control_n or heavy_n or ad_n:
             logger.info(
                 "Queued %s control + %s heavy + %s ad command(s) from %s (control_q=%s heavy_q=%s ad_q=%s)",
@@ -645,6 +693,15 @@ class Agent:
                 self._command_queue.qsize(),
                 self._ad_queue.qsize(),
             )
+
+    def _is_superseded(self, command: dict) -> bool:
+        """A queued play/next/previous/seek older than the newest play/pause/stop."""
+        if command.get("type") != "playback_control":
+            return False
+        if (command.get("action") or "").lower() not in _SUPERSEDABLE_ACTIONS:
+            return False
+        seq = command.get("_seq")
+        return seq is not None and seq < self._latest_intent_seq
 
     async def _drain_command_queues(self) -> None:
         """Let a stop that arrived with the handshake finish before we resume."""
@@ -711,15 +768,21 @@ class Agent:
             self._resume_not_before = time.monotonic() + 30
 
     async def _start_websocket_with_retries(self) -> None:
-        reconnect_delay = 5
+        reconnect_delay = 5.0
         while self.running:
+            started = time.monotonic()
+            self._ws_established_at = 0.0
             try:
                 await self._start_websocket()
                 return
             except Exception as exc:
-                logger.warning("WS failed (%s). Retrying in %ss", exc, reconnect_delay)
+                # After a connection that held, reconnect fast: the delay used to
+                # keep growing for the agent's whole life (60s+ per drop).
+                if self._ws_established_at and self._ws_established_at >= started:
+                    reconnect_delay = 2.0
+                logger.warning("WS failed (%s). Retrying in %.0fs", exc, reconnect_delay)
                 await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 1.5, 60)
+                reconnect_delay = min(reconnect_delay * 1.5, 60.0)
 
     async def _start_websocket(self) -> None:
         if not self.config.ws_url or not self.device.device_token:
@@ -763,7 +826,23 @@ class Agent:
         if not self.ws_client.connected:
             ws_task.cancel()
             raise RuntimeError("WS connection failed to establish")
+        self._ws_established_at = time.monotonic()
 
+        try:
+            await self._run_ws_status_loop()
+        finally:
+            # Stop this client's own reconnect loop too; left running it could
+            # finish a handshake later and give the branch a second socket that
+            # executes every command twice.
+            await self.ws_client.disconnect()
+            ws_task.cancel()
+            try:
+                await ws_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        raise RuntimeError("WS connection lost")
+
+    async def _run_ws_status_loop(self) -> None:
         await self._resume_if_server_allows()
 
         # Adaptive WS cadence:
@@ -817,10 +896,6 @@ class Agent:
                 asyncio.create_task(self._refresh_transition_campaigns())
 
             await asyncio.sleep(playing_interval_s if is_playing else idle_interval_s)
-
-        if self.ws_client:
-            await self.ws_client.disconnect()
-        raise RuntimeError("WS connection lost")
 
     async def _long_polling_loop(self) -> None:
         self.is_connected = True
@@ -900,15 +975,20 @@ class Agent:
             self._suppress_resume = True
             status = await self.player.get_status()
             track_id = status.get("current_track_id")
-            if track_id:
-                await self._log_track_playback(
-                    track_id=int(track_id),
-                    playlist_id=status.get("current_playlist_id"),
-                    duration_played=float(status.get("playback_position") or 0.0),
-                )
+            # Stop first: the log is an HTTP call (up to 10s), and awaiting it
+            # first meant a slow server delayed the stop, held up volume/pause
+            # behind it, and could time the stop out before VLC ever stopped.
             await self.player.stop()
+            if track_id:
+                asyncio.create_task(
+                    self._log_track_playback(
+                        track_id=int(track_id),
+                        playlist_id=status.get("current_playlist_id"),
+                        duration_played=float(status.get("playback_position") or 0.0),
+                    )
+                )
         elif action in {"skip", "next"}:
-            await self.player.next()
+            await self.player.next(steps=int(command.get("steps") or 1), user=True)
         elif action == "previous":
             await self.player.previous()
         elif action == "seek":
@@ -1025,6 +1105,15 @@ class Agent:
             self._last_transition_refresh = time.time()
             logger.info("Loaded %s transition ad campaign(s)", len(self._transition_campaigns))
 
+    async def _safe_refresh_transition_campaigns(self) -> None:
+        try:
+            await self._refresh_transition_campaigns()
+        except Exception as exc:
+            logger.warning("Failed to refresh transition campaigns: %s", exc)
+        finally:
+            # A failed refresh waits a minute too, instead of retrying every song.
+            self._last_transition_refresh = max(self._last_transition_refresh, time.time() - 30)
+
     def _pick_transition_campaign(self) -> Optional[dict]:
         if self._holiday_ads_paused or not self._transition_campaigns:
             return None
@@ -1040,11 +1129,13 @@ class Agent:
         return pick
 
     async def _on_ad_transition_check(self) -> bool:
-        if time.time() - self._last_transition_refresh >= 60:
-            try:
-                await self._refresh_transition_campaigns()
-            except Exception as exc:
-                logger.warning("Failed to refresh transition campaigns: %s", exc)
+        # Refresh in the background and decide with what is cached: this runs at
+        # the end of every song, and waiting on the server here (up to 10s) was
+        # silence between songs.
+        if time.time() - self._last_transition_refresh >= 60 and not (
+            self._campaign_refresh_task and not self._campaign_refresh_task.done()
+        ):
+            self._campaign_refresh_task = asyncio.create_task(self._safe_refresh_transition_campaigns())
         if self._holiday_ads_paused:
             return False
         self.player._tracks_since_ad += 1
