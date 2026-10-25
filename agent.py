@@ -70,6 +70,12 @@ _SUPERSEDABLE_ACTIONS = {"play", "next", "skip", "previous", "seek"}
 _NEW_TRACK_ACTIONS = {"play", "pause", "stop", "next", "skip", "previous"}
 
 
+def _command_sender(command: dict) -> str:
+    """Who sent a command, for the log: a dashboard user or the server itself."""
+    user_id = command.get("user_id")
+    return f"user {user_id}" if user_id else "system"
+
+
 @dataclass(frozen=True)
 class DeviceConfig:
     device_id: str
@@ -444,6 +450,8 @@ class Agent:
         self._pending_next: Optional[dict] = None
         self._campaign_refresh_task: Optional[asyncio.Task] = None
         self._ws_established_at = 0.0
+        self._status_push_task: Optional[asyncio.Task] = None
+        self._status_dirty = False
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -451,6 +459,7 @@ class Agent:
         self.player.on_track_ended = self._log_track_playback
         self.player.on_ad_transition_check = self._on_ad_transition_check
         self.player.on_ad_finished = self._on_ad_finished
+        self.player.on_state_changed = self._on_player_state_changed
         self.player.restore_saved_volume()
         await self._refresh_transition_campaigns()
 
@@ -507,9 +516,10 @@ class Agent:
                 self._last_command_tick = time.time()
                 try:
                     logger.info(
-                        "Handling control command: type=%s action=%s",
+                        "Handling control command: type=%s action=%s by=%s",
                         command.get("type"),
                         command.get("action"),
+                        _command_sender(command),
                     )
                     await asyncio.wait_for(self._handle_command(command), timeout=10.0)
                 except asyncio.TimeoutError:
@@ -572,7 +582,9 @@ class Agent:
                     )
                     self._command_queue.task_done()
                     continue
-                logger.info("Handling command: type=%s action=%s", command_type, action)
+                logger.info(
+                    "Handling command: type=%s action=%s by=%s", command_type, action, _command_sender(command)
+                )
 
                 timeout_s = 30.0
                 if command_type == "ad_control":
@@ -859,32 +871,12 @@ class Agent:
             await self._resume_if_server_allows()
 
             status = await self.player.get_status()
-            pos = status.get("playback_position")
-            length = status.get("playback_length")
             is_playing = bool(status.get("is_playing", False))
-
-            payload = {
-                "type": "status_update",
-                "status": "healthy" if self.player.is_healthy() else "error",
-                "current_volume": status.get("volume", 50.0),
-                "is_playing": is_playing,
-                "current_track_id": status.get("current_track_id"),
-                "current_playlist_id": status.get("current_playlist_id"),
-                # Keep payload small — full track metadata is not needed every tick.
-                "track_position": status.get("track_position"),
-                "playback_position": float(pos) if pos is not None else 0.0,
-                "playback_length": float(length) if length is not None else 0.0,
-                "playback_speed": 1.0,
-            }
-            # Include current_track only when it changes (less WS/CPU load on Pi).
-            if (
-                self._last_ws_payload is None
-                or self._last_ws_payload.get("current_track_id") != payload.get("current_track_id")
-            ):
-                payload["current_track"] = status.get("current_track")
+            payload = self._build_status_payload(status)
 
             # Always send on every tick (coalesced by WS sender). Cadence:
             # playing every 5s, idle every 20s (keepalive for dashboard last_seen).
+            # Changes in between are pushed at once (_on_player_state_changed).
             ok = await self.ws_client.send(payload)
             if not ok or not self.ws_client.connected:
                 break
@@ -1030,14 +1022,42 @@ class Agent:
             "status": "healthy" if self.player.is_healthy() else "error",
             "current_volume": status.get("volume", 50.0),
             "is_playing": bool(status.get("is_playing", False)),
+            # loading / playing / paused / ad / stopped — what the dashboard shows
+            "state": status.get("state"),
+            "loading_track": status.get("loading_track"),
             "current_track_id": status.get("current_track_id"),
             "current_playlist_id": status.get("current_playlist_id"),
-            # Keep payload small — full track metadata is not needed every tick.
+            # Every time, not only on a change: the sender keeps just the newest
+            # status, so a title sent once could be replaced by a tick without it.
+            "current_track": status.get("current_track"),
             "track_position": status.get("track_position"),
             "playback_position": float(status.get("playback_position") or 0.0),
             "playback_length": float(status.get("playback_length") or 0.0),
             "playback_speed": 1.0,
+            "ad_playing": bool(status.get("ad_playing")),
+            "ad_campaign_name": status.get("ad_campaign_name"),
         }
+
+    def _on_player_state_changed(self) -> None:
+        """Push the new state now (a burst of changes becomes one update)."""
+        self._status_dirty = True
+        if self._status_push_task and not self._status_push_task.done():
+            return
+        try:
+            self._status_push_task = asyncio.get_running_loop().create_task(self._push_status_soon())
+        except RuntimeError:
+            pass
+
+    async def _push_status_soon(self) -> None:
+        # A change while one push is under way gets a push of its own.
+        while self._status_dirty:
+            self._status_dirty = False
+            # pause -> stop or start -> playing often land in the same moment
+            await asyncio.sleep(0.05)
+            try:
+                await self._push_status_update()
+            except Exception as exc:
+                logger.debug("Status push failed: %s", exc)
 
     async def _push_status_update(self) -> None:
         """Send an anchor immediately instead of waiting for the next status tick.

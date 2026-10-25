@@ -62,6 +62,8 @@ class MusicPlayer:
     PREFETCH_AT_FRACTION = 0.60
     # Cap for the above, so tracks of unknown length still get prefetched.
     PREFETCH_MAX_WAIT_S = 150.0
+    # Open the next song in the standby player this long before the current one ends.
+    PRELOAD_LEAD_S = 25.0
     # Silence held after a seek while VLC refetches and refills its buffer.
     SEEK_REBUFFER_S = 1.2
     # Extra silence after un-pausing, covering the audio output restart.
@@ -144,6 +146,22 @@ class MusicPlayer:
         self._youtube_hold_url: Optional[str] = None
         self._youtube_hold_track_id: Optional[Any] = None
         self._youtube_hold_saved_at: float = 0.0
+        # Gapless: the next song waits in a second VLC player, opened and paused on
+        # its first sample, so the switch is an un-pause (~0.3s) instead of a cold
+        # start with a muted warmup (~3s). GAPLESS=0 turns it off.
+        self._gapless = os.environ.get("GAPLESS", "1").strip().lower() not in ("0", "false", "no")
+        self._standby_player = None
+        # {"key": cache key of the waiting track, "player": the standby player}
+        self._preloaded: Optional[dict] = None
+        self._preload_task: Optional[asyncio.Task] = None
+        # Order of the next shuffled cycle, fixed before the current one ends
+        self._next_cycle: Optional[list] = None
+        # The song a start is working on (resolving, opening, warming up), so the
+        # dashboard can say "loading X" instead of showing the old song or a muted one.
+        self._starting_track: Optional[Dict[str, Any]] = None
+        # Called (no args, on the event loop) whenever what the dashboard shows
+        # changes: a start begins or ends, pause, resume, stop, an ad starts or ends.
+        self.on_state_changed: Optional[Callable[[], None]] = None
 
         self._init_vlc()
 
@@ -242,6 +260,7 @@ class MusicPlayer:
             self._restore_original_order(keep_track_id=current_id)
             logger.info("Shuffle disabled — restored playlist order")
         self._persist_playback_state()
+        self._replan_preload()
 
     def set_repeat_mode(self, mode: Optional[str]) -> None:
         """Update loop/repeat mode. Legacy 'shuffle' maps to shuffle+repeat_all."""
@@ -266,13 +285,32 @@ class MusicPlayer:
             self._shuffle_enabled(),
         )
         self._persist_playback_state()
+        self._replan_preload()
+
+    def _replan_preload(self) -> None:
+        """The next song may have changed (order or loop mode): prepare it again."""
+        if not self._expect_playing or not self.current_playlist:
+            return
+        # The URL fetched ahead may be for the old next song, too. Both are
+        # cheap when nothing changed: the URL is cached, the song still preloaded.
+        self._schedule_prefetch_next()
+        self._schedule_preload()
 
     def _reshuffle_playlist(self, keep_track_id=None, avoid_first_id=None) -> None:
         """Fisher-Yates shuffle of the canonical playlist. No song repeats in a cycle."""
+        self._next_cycle = None
+        self.current_playlist = self._shuffled_order(keep_track_id, avoid_first_id)
+        if len(self.current_playlist) > 1:
+            logger.info(
+                "Shuffled playlist (%s tracks), first=%s",
+                len(self.current_playlist),
+                self.current_playlist[0].get("title"),
+            )
+
+    def _shuffled_order(self, keep_track_id=None, avoid_first_id=None) -> list:
         source = list(self._original_playlist or self.current_playlist or [])
         if len(source) <= 1:
-            self.current_playlist = source
-            return
+            return source
         shuffled = source[:]
         random.shuffle(shuffled)
         if (
@@ -288,14 +326,37 @@ class MusicPlayer:
                 if str(track.get("id")) == str(keep_track_id):
                     shuffled.insert(0, shuffled.pop(i))
                     break
-        self.current_playlist = shuffled
-        logger.info(
-            "Shuffled playlist (%s tracks), first=%s",
-            len(shuffled),
-            shuffled[0].get("title") if shuffled else None,
+        return shuffled
+
+    def _starts_new_shuffled_cycle(self) -> bool:
+        """Auto-advance from here reshuffles: last song of a shuffled cycle."""
+        return (
+            bool(self.current_playlist)
+            and self._shuffle_enabled()
+            and self._loop_mode() == "repeat_all"
+            and self.current_index >= len(self.current_playlist) - 1
         )
 
+    def _planned_next_cycle(self) -> list:
+        """The order of the next shuffled cycle, decided while its last song still
+        plays, so prefetch and preload get the song the new cycle really starts with."""
+        ids = sorted(str(t.get("id")) for t in self.current_playlist)
+        if not self._next_cycle or sorted(str(t.get("id")) for t in self._next_cycle) != ids:
+            last_id = self.current_playlist[self.current_index].get("id")
+            self._next_cycle = self._shuffled_order(avoid_first_id=last_id)
+        return self._next_cycle
+
+    def _next_track(self) -> Optional[Dict[str, Any]]:
+        """The song auto-advance plays next (None: playback ends after this one)."""
+        idx = self._next_track_index()
+        if idx is None:
+            return None
+        if self._starts_new_shuffled_cycle():
+            return self._planned_next_cycle()[0]
+        return self.current_playlist[idx]
+
     def _restore_original_order(self, keep_track_id=None) -> None:
+        self._next_cycle = None
         if self._original_playlist:
             self.current_playlist = list(self._original_playlist)
         if keep_track_id is not None and self.current_playlist:
@@ -360,7 +421,14 @@ class MusicPlayer:
             self.player = self.instance.media_player_new()
             self.player.audio_set_volume(int(self.volume))
             event_manager = self.player.event_manager()
-            event_manager.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_track_end)
+            event_manager.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_track_end, self.player)
+            if self._gapless:
+                # Same instance (ALSA). A paused player opens no audio output, so
+                # the two never hold the card at once.
+                self._standby_player = self.instance.media_player_new()
+                self._standby_player.event_manager().event_attach(
+                    vlc.EventType.MediaPlayerEndReached, self._on_track_end, self._standby_player
+                )
             self.ad_instance = self.instance
             ad_aout = {"Windows": "waveout", "Linux": "pulse"}.get(platform.system())
             if ad_aout:
@@ -542,6 +610,7 @@ class MusicPlayer:
                 self._progress_changed_at = time.monotonic()
                 self._play_started_at = time.monotonic()
                 self._persist_playback_state()
+                self._notify_state()
                 return
 
         if shuffle is True:
@@ -624,6 +693,7 @@ class MusicPlayer:
             self._progress_changed_at = time.monotonic()
             self._play_started_at = time.monotonic()
             self._persist_playback_state()
+            self._notify_state()
             return
 
         # Grace window: even if state flickers to Stopped for a moment, don't restart.
@@ -660,6 +730,15 @@ class MusicPlayer:
                 ) = previous_state
                 logger.info("Switch to playlist %s did not start; still on %s", playlist_id, self.current_playlist_id)
 
+    def _notify_state(self) -> None:
+        callback = self.on_state_changed
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as exc:
+            logger.debug("on_state_changed failed: %s", exc)
+
     def supersede_pending_start(self) -> None:
         """A user command just arrived (it may still wait in a queue): a track
         start that is still resolving gives way instead of playing first."""
@@ -691,6 +770,7 @@ class MusicPlayer:
         self._stall_since = None
         self._persist_playback_state()
         logger.info("Paused playback")
+        self._notify_state()
 
     async def stop(self) -> None:
         self._intent += 1
@@ -699,6 +779,8 @@ class MusicPlayer:
             self._expect_playing = False
             self._stall_since = None
             self._persist_playback_state()
+        self._notify_state()
+        await self._discard_preload()
 
     async def next(self, steps: int = 1, *, user: bool = False, epoch: Optional[int] = None) -> None:
         """Advance ``steps`` tracks. ``user``: a dashboard command (a new intent).
@@ -714,8 +796,10 @@ class MusicPlayer:
         for _ in range(max(1, int(steps))):
             at_end = self.current_index >= len(self.current_playlist) - 1
             if at_end and self._shuffle_enabled():
-                last_id = self.current_playlist[self.current_index].get("id")
-                self._reshuffle_playlist(avoid_first_id=last_id)
+                # The order prefetch/preload already prepared, if still valid
+                planned = self._planned_next_cycle()
+                self._next_cycle = None
+                self.current_playlist = planned
                 self.current_index = 0
                 logger.info("Reshuffled playlist for a new cycle")
             else:
@@ -792,6 +876,8 @@ class MusicPlayer:
         if not self.player:
             return {
                 "is_playing": False,
+                "state": "stopped",
+                "loading_track": None,
                 "volume": self.volume,
                 "current_track_id": self.current_track_id,
                 "current_playlist_id": self.current_playlist_id,
@@ -847,6 +933,8 @@ class MusicPlayer:
             }
         return {
             "is_playing": is_playing,
+            "state": self._player_state(state, is_playing),
+            "loading_track": self._track_summary(self._starting_track),
             "volume": self.volume,
             "current_track_id": self.current_track_id,
             "current_playlist_id": self.current_playlist_id,
@@ -858,6 +946,26 @@ class MusicPlayer:
             "ad_campaign_id": self._ad_campaign_id if self._ad_playing else None,
             "ad_campaign_name": self._ad_campaign_name if self._ad_playing else None,
         }
+
+    def _player_state(self, vlc_state: Any, is_playing: bool) -> str:
+        """One word for what a listener hears: loading, playing, paused, ad or stopped."""
+        if self._starting_track is not None:
+            return "loading"
+        # The music is silent under these (between songs, or faded out and stopped);
+        # under a ducked ad it keeps playing, quieter.
+        if self._ad_playing and self._ad_overlay_mode != "duck":
+            return "ad"
+        if is_playing:
+            return "playing"
+        if vlc and vlc_state == vlc.State.Paused:
+            return "paused"
+        return "stopped"
+
+    @staticmethod
+    def _track_summary(track: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not track:
+            return None
+        return {key: track.get(key) for key in ("id", "title", "artist", "thumbnail_url", "source_id") if key in track}
 
     async def _load_playlist(self, playlist_id: int) -> bool:
         """Fetch and switch to a playlist. On failure nothing changes (returns False)."""
@@ -986,7 +1094,12 @@ class MusicPlayer:
             if epoch is not None and epoch != self._intent:
                 logger.info("Track start dropped — a newer command took over")
                 return
-            await self._play_current_track_locked(_skip_depth=_skip_depth)
+            try:
+                await self._play_current_track_locked(_skip_depth=_skip_depth)
+            finally:
+                # Playing, failed or dropped: no longer loading either way.
+                self._starting_track = None
+                self._notify_state()
 
     async def _play_current_track_locked(
         self,
@@ -1009,6 +1122,24 @@ class MusicPlayer:
             return
 
         track = self.current_playlist[self.current_index]
+        if self._starting_track is not track:
+            self._starting_track = track
+            self._notify_state()
+        if self._preloaded:
+            if (
+                self._preloaded["key"] == self._cache_key(track)
+                and not (_fresh_retry or _youtube_hold or media_url_override)
+            ):
+                if await self._start_preloaded(track, epoch):
+                    return
+                # It would not run: most likely the link went stale, resolve afresh.
+                self._invalidate_cached_url(track)
+                _fresh_retry = True
+            else:
+                await self._discard_preload()
+        elif self._preload_task and not self._preload_task.done():
+            # Still opening for the song that just ended; this start goes cold.
+            await self._discard_preload()
         used_cached_url = False
         media_url = None
         blocked = False
@@ -1059,18 +1190,7 @@ class MusicPlayer:
             await self._play_current_track_locked(_skip_depth=_skip_depth + 1)
             return
 
-        media = self.instance.media_new(media_url)
-        # Media-level options stick more reliably than instance flags for HTTP/DASH.
-        for opt in (
-            ":network-caching=5000",
-            ":file-caching=3000",
-            ":http-reconnect",
-            ":no-video",
-        ):
-            try:
-                media.add_option(opt)
-            except Exception:
-                pass
+        media = self._new_music_media(media_url)
 
         # Mute while VLC fills the network buffer, so a rough start is inaudible.
         self._warming_up = True
@@ -1184,6 +1304,216 @@ class MusicPlayer:
             )
         # Resolve the *next* track in the background so song transitions are near-instant.
         self._schedule_prefetch_next()
+        self._schedule_preload()
+
+    def _new_music_media(self, url: str, *, start_paused: bool = False) -> Any:
+        media = self.instance.media_new(url)
+        # Media-level options stick more reliably than instance flags for HTTP/DASH.
+        options = [":network-caching=5000", ":file-caching=3000", ":http-reconnect", ":no-video"]
+        if start_paused:
+            # Opens the stream and fills the buffer, then waits on the first sample.
+            options.append(":start-paused")
+        for opt in options:
+            try:
+                media.add_option(opt)
+            except Exception:
+                pass
+        return media
+
+    def _schedule_preload(self) -> None:
+        if not self._gapless or not self._standby_player:
+            return
+        if self._preload_task and not self._preload_task.done():
+            self._preload_task.cancel()
+        try:
+            self._preload_task = asyncio.get_running_loop().create_task(self._preload_next_track())
+        except RuntimeError:
+            return
+
+    async def _preload_next_track(self) -> None:
+        """Near the end of this song, open the next one paused in the standby player."""
+        # Tied to the song, not to the intent: a pause and resume keep it waiting,
+        # a switch to another song ends it (stop cancels it).
+        track_id = self.current_track_id
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                if self.current_track_id != track_id:
+                    return
+                # Under a ducked ad the song keeps playing (quietly) and may end
+                # there; the standby opens no output, so preparing is still fine.
+                ad_blocks = self._ad_playing and self._ad_overlay_mode != "duck"
+                if ad_blocks or not self.player or not self._expect_playing:
+                    continue
+                try:
+                    length_ms = self.player.get_length()
+                    pos_ms = self.player.get_time()
+                except Exception:
+                    return
+                if not length_ms or length_ms <= 0 or pos_ms < 0:
+                    continue
+                if length_ms - pos_ms > self.PRELOAD_LEAD_S * 1000:
+                    continue
+                nxt_track = self._next_track()
+                if nxt_track is None:
+                    return
+                if self._preloaded and self._preloaded["key"] == self._cache_key(nxt_track):
+                    return  # a re-plan that didn't change the next song
+                url = self._get_cached_url(nxt_track)
+                if not url:
+                    # The prefetch may still land before the song ends.
+                    if length_ms - pos_ms < 3000:
+                        return
+                    continue
+                await self._preload_standby(nxt_track, url, track_id)
+                return
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Preload failed: %s", exc)
+
+    async def _preload_standby(self, track: Dict[str, Any], url: str, playing_id: Any) -> None:
+        """Open `track` paused in the standby player, while `playing_id` still plays."""
+        standby = self._standby_player
+        if not standby or not vlc:
+            return
+        await self._discard_preload(keep_task=True)
+        media = self._new_music_media(url, start_paused=True)
+        standby.set_media(media)
+        try:
+            media.release()
+        except Exception:
+            pass
+        standby.audio_set_volume(0)
+        standby.play()
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            if self.current_track_id != playing_id or standby is self.player:
+                break
+            try:
+                if standby.get_state() == vlc.State.Paused:
+                    self._preloaded = {"key": self._cache_key(track), "player": standby}
+                    logger.info("Preloaded next track %s (paused, ready)", track.get("id"))
+                    return
+                if standby.get_state() in (vlc.State.Error, vlc.State.Ended):
+                    break
+            except Exception:
+                break
+        logger.info("Preload of track %s did not get ready; the switch will start it cold", track.get("id"))
+        await self._discard_preload(keep_task=True)
+
+    async def _discard_preload(self, *, keep_task: bool = False) -> None:
+        """Drop the song waiting in the standby player (stops its stream)."""
+        self._preloaded = None
+        if not keep_task and self._preload_task and not self._preload_task.done():
+            if self._preload_task is not asyncio.current_task():
+                self._preload_task.cancel()
+        standby = self._standby_player
+        if standby is not None and standby is not self.player:
+            await self._reset_player_for_new_media(standby)
+
+    async def _start_preloaded(self, track: Dict[str, Any], epoch: int) -> bool:
+        """Switch to the song waiting paused in the standby player. False: not usable."""
+        new = self._preloaded["player"]
+        self._preloaded = None
+        old = self.player
+        try:
+            if new is None or new.get_state() != vlc.State.Paused:
+                if new is not None:
+                    new.stop()
+                return False
+        except Exception:
+            return False
+
+        self.current_track_id = track.get("id")
+        self.current_track = track
+        self._expect_playing = True
+        self._persist_playback_state()
+        self._stall_since = None
+        self._play_started_at = time.monotonic()
+        self._last_known_position_s = 0.0
+        self._progress_position_ms = -1
+        self._progress_changed_at = time.monotonic()
+        self._seeked_at = 0.0
+
+        switch_at = time.monotonic()
+        # The old song first: its output must be gone before the new one opens.
+        try:
+            old.stop()
+        except Exception:
+            pass
+        self.player, self._standby_player = new, old
+        target = int(self.volume)
+        if self._ad_playing:
+            new.audio_set_volume(0)  # the ad's end restores the music level
+        else:
+            self._apply_intended_volume(target)
+        new.set_pause(0)
+
+        start_ms = int(new.get_time() or 0)
+        running = False
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+            try:
+                if new.get_state() == vlc.State.Playing and int(new.get_time() or 0) > start_ms + 100:
+                    running = True
+                    break
+                if new.get_state() in (vlc.State.Error, vlc.State.Ended):
+                    break
+            except Exception:
+                break
+        if running:
+            # Un-paused, a :start-paused input often keeps a stale clock: the
+            # audio output then drops every buffer as "too late" and the song
+            # plays as silence (seen on the test VM in half the switches). A seek
+            # to where it is flushes the buffers and restarts the clock; measured
+            # 6 of 6 switches clean, audible after 0.1-0.9s.
+            try:
+                new.set_time(int(new.get_time() or 0))
+            except Exception:
+                pass
+            resync_ms = int(new.get_time() or 0)
+            running = False
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+                try:
+                    if new.get_state() == vlc.State.Playing and int(new.get_time() or 0) > resync_ms + 100:
+                        running = True
+                        break
+                    if new.get_state() in (vlc.State.Error, vlc.State.Ended):
+                        break
+                except Exception:
+                    break
+        if not running:
+            logger.warning("Preloaded track %s would not run — starting it fresh", track.get("id"))
+            try:
+                new.stop()
+            except Exception:
+                pass
+            return False
+        if not self._ad_playing:
+            # Same check as after a warmup: the output may drop the first set.
+            await self._unmute_after_warmup(int(self.volume))
+
+        self._play_started_at = time.monotonic()
+        self._progress_changed_at = time.monotonic()
+        url = self._get_cached_url(track)
+        if track.get("source") == "youtube" and url:
+            self._youtube_hold_url = url
+            self._youtube_hold_track_id = track.get("id")
+            self._youtube_hold_saved_at = time.monotonic()
+        logger.info(
+            "Playing track %s (preloaded, switch %.0f ms)",
+            self.current_track_id,
+            (time.monotonic() - switch_at) * 1000,
+        )
+        if epoch == self._intent:
+            self._schedule_prefetch_next()
+            self._schedule_preload()
+        return True
 
     async def _reset_player_for_new_media(self, player: Any = None) -> None:
         """Return a media player to a state from which play() is honoured.
@@ -1406,10 +1736,9 @@ class MusicPlayer:
             # The wait also ends on stop/pause; resolving then is wasted CPU.
             if not self.current_playlist or self._ad_playing or not self._expect_playing:
                 return
-            nxt = self._next_track_index()
-            if nxt is None:
+            track = self._next_track()
+            if track is None:
                 return
-            track = self.current_playlist[nxt]
             if self._get_cached_url(track):
                 logger.info("Next track %s already prefetched", track.get("id"))
                 return
@@ -1457,10 +1786,9 @@ class MusicPlayer:
         # crashed prefetch task still gets the next URL cached before the track ends.
         if pos_ms < length_ms * self.PREFETCH_AT_FRACTION:
             return
-        nxt = self._next_track_index()
-        if nxt is None:
+        track = self._next_track()
+        if track is None:
             return
-        track = self.current_playlist[nxt]
         if self._get_cached_url(track):
             return
         if self._resolve_backoff_active(track):
@@ -1604,7 +1932,11 @@ class MusicPlayer:
             await self._play_current_track(epoch=epoch)
         return True
 
-    def _on_track_end(self, event: Any) -> None:
+    def _on_track_end(self, event: Any, source: Any = None) -> None:
+        # Gapless swaps the two players; an end from the one that is no longer
+        # the active player (it was just replaced) is not the music ending.
+        if source is not None and source is not self.player:
+            return
         if self._event_loop and self._event_loop.is_running():
             asyncio.run_coroutine_threadsafe(self._handle_track_end(), self._event_loop)
 
@@ -1985,6 +2317,7 @@ class MusicPlayer:
                 self._force_ad_player_volume(ad_volume)
                 logger.info("Playing ad campaign %s on overlay player", campaign_id)
                 self._start_ad_watchdog(campaign_id)
+                self._notify_state()
                 return True
             except Exception as exc:
                 logger.error("play_ad failed: %s", exc, exc_info=True)
@@ -2075,6 +2408,7 @@ class MusicPlayer:
         self._ad_overlay_mode = "duck"
         self._ad_after_finish_action = None
         self._ad_schedule_config = {}
+        self._notify_state()
 
         if self.on_ad_finished and campaign_id is not None:
             try:
