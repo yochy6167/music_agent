@@ -221,6 +221,11 @@ class ServerClient:
             return None
 
 
+# Application-level ping (answered by the server's message loop, see _liveness_loop)
+WS_APP_PING_INTERVAL_S = 20.0
+WS_APP_PONG_TIMEOUT_S = 45.0
+
+
 class WebSocketClient:
     def __init__(self, ws_url: str, device_token: str, branch_id: int) -> None:
         if ws_url.startswith("http://"):
@@ -242,6 +247,8 @@ class WebSocketClient:
         self._outbound: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue(maxsize=100)
         self._sender_task: Optional[asyncio.Task] = None
         self._pending_status: Optional[Dict[str, Any]] = None
+        self._liveness_task: Optional[asyncio.Task] = None
+        self._last_pong = 0.0
 
     async def connect(self) -> None:
         if self.connected:
@@ -274,6 +281,8 @@ class WebSocketClient:
                         except asyncio.QueueEmpty:
                             break
                     self._sender_task = asyncio.create_task(self._sender_loop())
+                    self._last_pong = time.monotonic()
+                    self._liveness_task = asyncio.create_task(self._liveness_loop(websocket))
                     if self.on_connect:
                         self.on_connect()
                     try:
@@ -283,9 +292,15 @@ class WebSocketClient:
                             except json.JSONDecodeError:
                                 logger.error("Invalid JSON message from WS")
                                 continue
+                            if data.get("type") == "pong":
+                                self._last_pong = time.monotonic()
+                                continue
                             if self.on_message:
                                 asyncio.create_task(self._run_message_handler(data))
                     finally:
+                        if self._liveness_task:
+                            self._liveness_task.cancel()
+                            self._liveness_task = None
                         if self._sender_task:
                             self._sender_task.cancel()
                             try:
@@ -316,6 +331,30 @@ class WebSocketClient:
                 if self._running:
                     await asyncio.sleep(reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 1.5, 30)
+
+    async def _liveness_loop(self, websocket: Any) -> None:
+        """Reconnect when the server stops answering our pings.
+
+        The library's own pings are answered below the application, so a server
+        that stopped reading our messages (its loop stuck) still looked alive:
+        for six minutes commands kept arriving while no status reached the
+        dashboard. A ping it has to answer itself goes through that same loop.
+        """
+        try:
+            while True:
+                await asyncio.sleep(WS_APP_PING_INTERVAL_S)
+                if time.monotonic() - self._last_pong > WS_APP_PONG_TIMEOUT_S:
+                    logger.warning(
+                        "No pong from the server for %.0fs — the connection is one-way, reconnecting",
+                        time.monotonic() - self._last_pong,
+                    )
+                    await websocket.close()
+                    return
+                await self.send({"type": "ping"})
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("WS liveness check stopped: %s", exc)
 
     async def _run_message_handler(self, data: Dict[str, Any]) -> None:
         try:
