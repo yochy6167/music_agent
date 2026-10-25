@@ -1948,6 +1948,14 @@ class MusicPlayer:
         # What the user wanted when this track ended; a pause/stop/new play that
         # lands while the ad check or analytics run must not be overridden.
         epoch = self._intent
+        if self._starting_track is not None:
+            # A song that is being started "ended": its stream failed (a stale link
+            # ends at once). The start retries or skips it itself; advancing here
+            # as well skipped one more song (heard on the test VM: a preloaded
+            # song failed on its switch, played 6s from a fresh start, then the
+            # second advance cut it off).
+            logger.info("Track end during a track start — left to the start")
+            return
         if self._ad_playing:
             if self._ad_overlay_mode == "duck":
                 self._ad_after_finish_action = self._ad_after_finish_action or "next"

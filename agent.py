@@ -1370,6 +1370,13 @@ class Agent:
             "is_playing": status.get("is_playing", False),
             "current_track_id": status.get("current_track_id"),
             "current_playlist_id": status.get("current_playlist_id"),
+            # The same picture as the WS status: when WS is down this is all the
+            # dashboard gets, and a new track id without its title left the old one.
+            "current_track": status.get("current_track"),
+            "state": status.get("state"),
+            "loading_track": status.get("loading_track"),
+            "ad_playing": bool(status.get("ad_playing")),
+            "ad_campaign_name": status.get("ad_campaign_name"),
             "track_position": status.get("track_position"),
             "playback_position": status.get("playback_position"),
             "playback_length": status.get("playback_length"),
