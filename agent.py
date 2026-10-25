@@ -1279,6 +1279,20 @@ class Agent:
                     await self._send_ws_log("Git fetch failed. Update aborted.")
                     return
                 code, _out, err = await self._run_exec(["git", "checkout", "--detach", "FETCH_HEAD"])
+        elif (await self._run_exec(["git", "symbolic-ref", "-q", "HEAD"]))[0] != 0:
+            # On a tag (an earlier pinned update), not a branch: "git pull" fails
+            # there ("You are not currently on a branch"). Take the newest release.
+            await self._send_ws_log("No version given; moving to the newest release tag...")
+            code, _out, err = await self._run_exec(["git", "fetch", "--tags", "--force", "origin"])
+            if code == 0:
+                code, out, err = await self._run_exec(["git", "tag", "--list", "v*", "--sort=-v:refname"])
+                newest = next((t for t in out.split() if _PINNED_GIT_REF.fullmatch(t)), None)
+                if code == 0 and not newest:
+                    code, err = 1, "no release tag (vX.Y.Z) in the repository"
+                if code == 0:
+                    logger.info("Updating to the newest release tag %s", newest)
+                    await self._send_ws_log(f"Checking out {newest}...")
+                    code, _out, err = await self._run_exec(["git", "checkout", "--detach", f"refs/tags/{newest}"])
         else:
             logger.warning(
                 "Update has no pinned git_ref; fast-forwarding the current branch. "
