@@ -146,7 +146,9 @@ pip install --upgrade pip
 pip install -r requirements.txt
 pip install -U "yt-dlp[default]"
 
-chmod +x "${SCRIPT_DIR}/scripts/set-system-volume.sh" 2>/dev/null || true
+# No chmod +x on tracked scripts: the service runs them with /bin/bash, and a
+# changed exec bit made git refuse every later remote update that touched the file.
+git -C "${SCRIPT_DIR}" config core.fileMode false 2>/dev/null || true
 
 echo "Configuring systemd service..."
 SERVICE_NAME="music_agent"

@@ -1382,6 +1382,30 @@ class Agent:
                 logger.error(line.rstrip())
         return process.returncode or 0, out_text, err_text
 
+    async def _git_checkout(self, target: str) -> tuple:
+        """git checkout --detach, past local changes left on the player.
+
+        setup.sh used to chmod +x scripts/set-system-volume.sh, so git saw that
+        file as changed on every installed Pi and refused any tag that touches
+        it ("would be overwritten"). The exec bit is no longer compared, and real
+        local edits are put in a stash (still there: `git stash list`) instead
+        of blocking every update.
+        """
+        await self._run_exec(["git", "config", "core.fileMode", "false"])
+        code, out, err = await self._run_exec(["git", "checkout", "--detach", target])
+        if code != 0 and "would be overwritten" in err:
+            changed = (await self._run_exec(["git", "status", "--short"]))[1].strip().replace("\n", ", ")
+            logger.warning("Local changes block the update; stashing them: %s", changed)
+            await self._send_ws_log(f"Local changes on the player saved in git stash: {changed}")
+            stash, _out, stash_err = await self._run_exec(
+                ["git", "-c", "user.name=music_agent", "-c", "user.email=agent@localhost",
+                 "stash", "push", "--include-untracked", "-m", f"local changes before update to {target}"]
+            )
+            if stash != 0:
+                return stash, _out, stash_err
+            code, out, err = await self._run_exec(["git", "checkout", "--detach", target])
+        return code, out, err
+
     async def _handle_update_software(self, command: dict) -> None:
         """The update, reported to the dashboard as command_result when it has a command_id."""
         self._update_command, self._update_error = command, None
@@ -1433,7 +1457,7 @@ class Agent:
                     await self._update_failed("Pinned commit is not in the fetched history.")
                     await self._send_ws_log("Pinned commit was not found. Update aborted.")
                     return
-                code, _out, err = await self._run_exec(["git", "checkout", "--detach", git_ref])
+                code, _out, err = await self._git_checkout(git_ref)
             else:
                 tag_ref = git_ref if git_ref.startswith("refs/tags/") else f"refs/tags/{git_ref}"
                 code, _out, err = await self._run_exec(["git", "fetch", "origin", tag_ref])
@@ -1441,7 +1465,7 @@ class Agent:
                     await self._update_failed("Remote update failed during git fetch.")
                     await self._send_ws_log("Git fetch failed. Update aborted.")
                     return
-                code, _out, err = await self._run_exec(["git", "checkout", "--detach", "FETCH_HEAD"])
+                code, _out, err = await self._git_checkout("FETCH_HEAD")
         elif (await self._run_exec(["git", "symbolic-ref", "-q", "HEAD"]))[0] != 0:
             # On a tag (an earlier pinned update), not a branch: "git pull" fails
             # there ("You are not currently on a branch"). Take the newest release.
@@ -1455,7 +1479,7 @@ class Agent:
                 if code == 0:
                     logger.info("Updating to the newest release tag %s", newest)
                     await self._send_ws_log(f"Checking out {newest}...")
-                    code, _out, err = await self._run_exec(["git", "checkout", "--detach", f"refs/tags/{newest}"])
+                    code, _out, err = await self._git_checkout(f"refs/tags/{newest}")
         else:
             logger.warning(
                 "Update has no pinned git_ref; fast-forwarding the current branch. "
@@ -1465,8 +1489,9 @@ class Agent:
             code, _out, err = await self._run_exec(["git", "pull", "--ff-only"])
 
         if code != 0:
-            logger.error("Git update failed (%s): %s", code, (err or "").strip())
-            await self._update_failed("Remote update failed during git update.")
+            reason = (err or "").strip()
+            logger.error("Git update failed (%s): %s", code, reason)
+            await self._update_failed(f"Remote update failed during git update: {reason[-300:]}")
             await self._send_ws_log("Git update failed. Update aborted.")
             return
 
