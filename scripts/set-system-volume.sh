@@ -65,24 +65,9 @@ select_sink_name() {
   return 1
 }
 
-# Once the agent manages the output (~/.config/soundops/audio.json has a mode,
-# set from the dashboard or a paired speaker), choosing the sink is its job:
-# picking one here at every start used to take the sound off the Bluetooth speaker.
-AUDIO_STATE="${HOME:-/home/$(id -un)}/.config/soundops/audio.json"
-MANAGED=0
-if [[ -f "${AUDIO_STATE}" ]] && grep -qE '"mode": *"(bluetooth|aux|hdmi|auto)"' "${AUDIO_STATE}"; then
-  MANAGED=1
-  saved="$(grep -oE '"sink_volume": *[0-9]+' "${AUDIO_STATE}" | grep -oE '[0-9]+$' || true)"
-  [[ -n "${saved}" ]] && VOLUME="${saved}"
-fi
-
 for _ in $(seq 1 30); do
   if pactl info >/dev/null 2>&1; then
-    if [[ "${MANAGED}" == "1" ]]; then
-      pactl set-sink-volume @DEFAULT_SINK@ "${VOLUME}%"
-      pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null || true
-      echo "Audio output chosen by the agent (${AUDIO_STATE}); volume ${VOLUME}%"
-    elif sink="$(select_sink_name)"; then
+    if sink="$(select_sink_name)"; then
       pactl set-default-sink "${sink}"
       pactl set-sink-volume "${sink}" "${VOLUME}%"
       pactl set-sink-mute "${sink}" 0 2>/dev/null || true
