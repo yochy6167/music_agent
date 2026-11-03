@@ -1,12 +1,18 @@
 import asyncio
 import json
 import logging
+import os
 import platform
+import secrets
+import socket
 import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent import Agent, AgentConfig, DeviceConfig, ServerClient, agent_version
+from device_ops import OpError, identify_led, restore_led
+from health import image_version, local_ip
+from oscmd import STATE_DIR, SYSTEM_DIR, write_json_atomic
 
 _config_write_lock = threading.Lock()
 
@@ -178,6 +184,58 @@ def _persist_device_entry_unlocked(
         json.dump(data, handle, ensure_ascii=False, indent=2)
 
 
+# Waiting for approval: ask this often (the dashboard shows "assigned" within that time)
+PENDING_POLL_S = 10
+RETRY_S = 30
+# What this agent can do beyond playing; the server shows such a Pi as remotely manageable
+FEATURES = ["device_ops_v1"]
+
+
+def claim_secret() -> str:
+    """A secret made on this Pi: after approval the token goes only to whoever shows it.
+
+    The SD image writes /etc/soundops/claim_secret on first boot; a Pi installed
+    with setup.sh makes its own here on the first registration.
+    """
+    for path in (SYSTEM_DIR / "claim_secret", STATE_DIR / "claim_secret"):
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if len(value) >= 16:
+            return value
+    value = secrets.token_urlsafe(32)
+    path = STATE_DIR / "claim_secret"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+    os.chmod(path, 0o600)
+    return value
+
+
+def registration_details() -> Dict[str, Any]:
+    return {
+        "claim_secret": claim_secret(),
+        "hostname": socket.gethostname()[:64],
+        "local_ip": local_ip(),
+        "image_version": image_version(),
+        "agent_version": agent_version(),
+        "features": FEATURES,
+    }
+
+
+async def run_pending_commands(commands: List[dict]) -> None:
+    """An unassigned Pi gets only "identify" (blink the LED), through its register poll."""
+    for command in commands or []:
+        if command.get("action") != "identify":
+            continue
+        seconds = int((command.get("params") or {}).get("seconds") or 30)
+        try:
+            await identify_led(max(5, min(seconds, 120)))
+            logging.info("Identify: blinking the LED for %ss", seconds)
+        except OpError as exc:
+            logging.warning("Identify failed: %s", exc.message)
+
+
 async def register_device_with_retry(
     api_url: str,
     device: DeviceConfig,
@@ -185,37 +243,60 @@ async def register_device_with_retry(
 ) -> Optional[Tuple[str, str, int]]:
     resolved_hardware_id = hardware_id or device.device_id or device.device_name or f"branch-{device.branch_id}"
     client = ServerClient(api_url=api_url, device_token="", device_id=device.device_id or resolved_hardware_id)
+    shown_code = None
     while True:
         response = await client.register_device(
             hardware_id=resolved_hardware_id,
             device_name=device.device_name,
             branch_id=device.branch_id,
             device_id=device.device_id or resolved_hardware_id,
+            extra=registration_details(),
         )
         if not response:
-            logging.warning("Device registration failed. Retrying in 30s.")
-            await asyncio.sleep(30)
+            logging.warning("Device registration failed (no answer from the server). Retrying in %ss.", RETRY_S)
+            await asyncio.sleep(RETRY_S)
             continue
         status = str(response.get("status", "")).lower()
+        if status == "error":
+            detail = response.get("detail")
+            if detail == "Waiting for approval":
+                # Older servers answer a pending device with 403
+                logging.info("Waiting for approval in the dashboard. Asking again in %ss.", PENDING_POLL_S)
+                await asyncio.sleep(PENDING_POLL_S)
+            else:
+                logging.warning("The server refused registration (%s: %s). Retrying in %ss.",
+                                response.get("http_status"), detail, RETRY_S)
+                await asyncio.sleep(RETRY_S)
+            continue
         if status == "pending":
-            logging.info("Device registration pending. Retrying in 30s.")
-            await asyncio.sleep(30)
+            code = response.get("pairing_code")
+            if code:
+                write_json_atomic(STATE_DIR / "pairing.json", {"pairing_code": code, "hardware_id": resolved_hardware_id})
+                if code != shown_code:
+                    logging.info("Waiting for approval in the dashboard. Pairing code: %s", code)
+                    shown_code = code
+            else:
+                logging.info("Device registration pending. Retrying in %ss.", PENDING_POLL_S)
+            await run_pending_commands(response.get("commands") or [])
+            await asyncio.sleep(PENDING_POLL_S)
             continue
         token = response.get("device_token") or response.get("token")
         if token:
+            # Assigned while "identify" was blinking: this loop ends, so hand the LED back now
+            await restore_led()
             resolved_device_id = str(response.get("device_id") or device.device_id or "").strip()
             resolved_branch_id = int(response.get("branch_id") or device.branch_id or 0)
             return str(token).strip(), resolved_device_id, resolved_branch_id
         if status == "claimed":
             logging.warning(
                 "Device token for hardware_id=%s was already issued. "
-                "Approve the device again to issue a new one.",
+                "Release the device in the dashboard (or approve it again) to get a new one.",
                 resolved_hardware_id,
             )
-            await asyncio.sleep(30)
+            await asyncio.sleep(RETRY_S)
             continue
-        logging.warning("Device registration returned no token. Retrying in 30s.")
-        await asyncio.sleep(30)
+        logging.warning("Device registration returned no token. Retrying in %ss.", RETRY_S)
+        await asyncio.sleep(RETRY_S)
 
 
 def run_device(agent_config: AgentConfig, device: DeviceConfig) -> None:

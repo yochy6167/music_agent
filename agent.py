@@ -17,6 +17,9 @@ import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidURI
 
+import health
+from audio_output import OutputManager
+from device_ops import DeviceOps
 from player import MusicPlayer
 
 logger = logging.getLogger(__name__)
@@ -133,22 +136,43 @@ class ServerClient:
         device_name: str,
         branch_id: int,
         device_id: str,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
+        """None: no answer. A refusal (4xx) comes back as {"status": "error", "http_status", "detail"}."""
         url = f"{self.api_url}/api/v1/devices/register"
         payload = {
             "hardware_id": hardware_id,
             "device_name": device_name,
             "branch_id": branch_id,
             "device_id": device_id,
+            **(extra or {}),
         }
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+                if 400 <= response.status_code < 500:
+                    try:
+                        detail = response.json().get("detail")
+                    except ValueError:
+                        detail = response.text[:200]
+                    return {"status": "error", "http_status": response.status_code, "detail": detail}
                 response.raise_for_status()
                 return response.json()
         except httpx.HTTPError as exc:
             logger.error("Register device error: %s", exc)
             return None
+
+    async def post_command_result(self, message: Dict[str, Any]) -> bool:
+        """HTTP backup for a command_result when the WebSocket is down."""
+        url = f"{self.api_url}/api/v1/devices/command-results"
+        body = {k: v for k, v in message.items() if k != "type"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(url, json=body, headers=self.headers)
+                return response.status_code < 400
+        except httpx.HTTPError as exc:
+            logger.warning("Command result over HTTP failed: %s", exc)
+            return False
 
     async def get_playback_authorization(self) -> Optional[Dict[str, Any]]:
         """Ask the server if a schedule is on. None means stay silent."""
@@ -422,6 +446,13 @@ class WebSocketClient:
             logger.warning("WS outbound queue full — dropping message type=%s", data.get("type"))
             return False
 
+    async def flush(self, timeout: float) -> None:
+        """Wait until what was queued has gone out (before a restart or reboot)."""
+        deadline = time.monotonic() + timeout
+        while self.connected and not self._outbound.empty() and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.2)
+
     async def disconnect(self) -> None:
         self._running = False
         self.connected = False
@@ -471,6 +502,17 @@ class Agent:
         self._command_queue: "asyncio.Queue[dict]" = asyncio.Queue()
         self._control_queue: "asyncio.Queue[dict]" = asyncio.Queue()
         self._ad_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+        # Device actions from the dashboard (Bluetooth, Wi-Fi, logs...): one at a
+        # time, beside the music, so a 15s speaker scan neither waits behind
+        # yt-dlp nor holds up a play.
+        self._ops_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+        self.output = OutputManager(on_change=self.request_health_push)
+        self.ops = DeviceOps(self)
+        self._health_wake = asyncio.Event()
+        self._last_health: Optional[Dict[str, Any]] = None
+        self._selfcheck_ok: Optional[bool] = None
+        self._update_command: Optional[dict] = None
+        self._update_error: Optional[str] = None
         self._command_worker_task: Optional[asyncio.Task] = None
         self._control_worker_task: Optional[asyncio.Task] = None
         self._ad_worker_task: Optional[asyncio.Task] = None
@@ -506,6 +548,13 @@ class Agent:
         self._control_worker_task = asyncio.create_task(self._control_worker())
         self._ad_worker_task = asyncio.create_task(self._ad_worker())
         asyncio.create_task(self._watchdog_loop())
+        try:
+            await self.output.start()
+        except Exception as exc:
+            logger.warning("Audio output manager did not start: %s", exc)
+        asyncio.create_task(self._ops_worker())
+        asyncio.create_task(self._health_loop())
+        asyncio.create_task(self._selfcheck_loop())
 
         # Always keep a light HTTP heartbeat as last_seen backup. WS status_update is
         # primary, but if the WS send path wedges the dashboard still sees the device.
@@ -545,6 +594,88 @@ class Agent:
 
     def _is_ad_command(self, command: dict) -> bool:
         return command.get("type") == "ad_control"
+
+    def _is_device_op(self, command: dict) -> bool:
+        action = (command.get("action") or "").upper().replace("-", "_")
+        return command.get("type") == "agent_control" and action != "UPDATE_SOFTWARE"
+
+    async def _ops_worker(self) -> None:
+        """Device actions, one at a time; each has its own time limit in DeviceOps."""
+        logger.info("Device ops worker started")
+        while self.running:
+            try:
+                command = await self._ops_queue.get()
+                try:
+                    await self.ops.handle(command)
+                except Exception as exc:
+                    logger.error("Device ops worker error: %s", exc)
+                finally:
+                    self._ops_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Device ops worker outer error: %s", exc)
+                await asyncio.sleep(0.5)
+
+    def request_health_push(self) -> None:
+        """Send the health report now (speaker / output / network changed)."""
+        self._health_wake.set()
+
+    def set_selfcheck(self, checks: list) -> None:
+        self._selfcheck_ok = all(c.get("ok") for c in checks)
+
+    async def _health_loop(self) -> None:
+        """device_health every minute, and at once after a change (not in each 5s status)."""
+        await asyncio.sleep(3)
+        while self.running:
+            try:
+                report = await health.collect(agent_version(), self.output, self._selfcheck_ok)
+                self._last_health = report
+                if self.ws_client and self.ws_client.connected:
+                    await self.ws_client.send({"type": "device_health", "health": report})
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Health report failed: %s", exc)
+            self._health_wake.clear()
+            try:
+                await asyncio.wait_for(self._health_wake.wait(), timeout=60)
+                await asyncio.sleep(1)  # a burst of changes is one report
+            except asyncio.TimeoutError:
+                pass
+
+    async def _selfcheck_loop(self) -> None:
+        await asyncio.sleep(20)
+        while self.running:
+            try:
+                self.set_selfcheck(await health.selfcheck())
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Self-check failed: %s", exc)
+            await asyncio.sleep(health.SELFCHECK_EVERY_S)
+
+    async def _after_ws_connect(self) -> None:
+        try:
+            await self.ops.flush_pending()
+        except Exception as exc:
+            logger.warning("Sending kept command results failed: %s", exc)
+        self.request_health_push()
+
+    async def flush_ws(self, timeout: float) -> None:
+        if self.ws_client and self.ws_client.connected:
+            await self.ws_client.flush(timeout)
+
+    async def restart_process(self, reason: str) -> None:
+        """Start this agent again in the same process (systemd keeps the PID)."""
+        logger.info("Restarting the agent: %s", reason)
+        await self.flush_ws(3.0)
+        await asyncio.sleep(1)
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as exc:
+            logger.warning("Exec restart failed: %s", exc)
+            os._exit(0)
 
     async def _control_worker(self) -> None:
         """Fast path for volume/pause/stop — never blocked behind yt-dlp/play."""
@@ -702,7 +833,15 @@ class Agent:
         control_n = 0
         heavy_n = 0
         ad_n = 0
+        ops_n = 0
         for command in filtered:
+            if not self.ops.claim(command):
+                logger.info("Ignoring repeated command %s (%s)", command.get("command_id"), command.get("action"))
+                continue
+            if self._is_device_op(command):
+                await self._ops_queue.put(command)
+                ops_n += 1
+                continue
             self._command_seq += 1
             command["_seq"] = self._command_seq
             action = (command.get("action") or "").lower()
@@ -733,12 +872,13 @@ class Agent:
                 heavy_n += 1
                 if command.get("type") == "playback_control" and action in {"next", "skip"}:
                     self._pending_next = command
-        if control_n or heavy_n or ad_n:
+        if control_n or heavy_n or ad_n or ops_n:
             logger.info(
-                "Queued %s control + %s heavy + %s ad command(s) from %s (control_q=%s heavy_q=%s ad_q=%s)",
+                "Queued %s control + %s heavy + %s ad + %s device command(s) from %s (control_q=%s heavy_q=%s ad_q=%s)",
                 control_n,
                 heavy_n,
                 ad_n,
+                ops_n,
                 source,
                 self._control_queue.qsize(),
                 self._command_queue.qsize(),
@@ -859,6 +999,7 @@ class Agent:
         def on_connect() -> None:
             self.is_connected = True
             logger.info("WS connected for device %s", self.device.device_id)
+            asyncio.create_task(self._after_ws_connect())
 
         def on_disconnect() -> None:
             self.is_connected = False
@@ -978,6 +1119,10 @@ class Agent:
                 await self._handle_ad_control(command)
             else:
                 logger.warning("Unknown command type: %s", command_type)
+                await self.ops.send_result(
+                    command.get("command_id"), "error", error_code="unknown_action",
+                    message=f"סוג פקודה לא מוכר: {command_type}",
+                )
         except Exception as exc:
             logger.error("Command error (%s %s): %s", command_type, action, exc)
 
@@ -1238,6 +1383,24 @@ class Agent:
         return process.returncode or 0, out_text, err_text
 
     async def _handle_update_software(self, command: dict) -> None:
+        """The update, reported to the dashboard as command_result when it has a command_id."""
+        self._update_command, self._update_error = command, None
+        try:
+            await self._run_update_software(command)
+        finally:
+            self._update_command = None
+        # Still here: no restart happened (a failure, or manual mode)
+        if self._update_error:
+            await self.ops.update_failed(command, "update_failed", self._update_error)
+        else:
+            await self.ops.send_result(command.get("command_id"), "ok", data={"version": agent_version()},
+                                       message="העדכון הותקן; נדרשת הפעלה מחדש ידנית")
+
+    async def _update_failed(self, message: str) -> None:
+        self._update_error = message
+        await self._send_update_notice(message)
+
+    async def _run_update_software(self, command: dict) -> None:
         logger.info("Starting remote update via Git...")
         await self._send_update_notice("Starting remote update via Git...")
 
@@ -1245,7 +1408,7 @@ class Agent:
         origin = origin.strip()
         if code != 0 or not _ALLOWED_ORIGIN.fullmatch(origin):
             logger.error("Refusing update: origin %r is not the music_agent repository", origin)
-            await self._send_update_notice("Remote update refused: unexpected git origin.")
+            await self._update_failed("Remote update refused: unexpected git origin.")
             await self._send_ws_log("Git origin is not the expected repository. Update aborted.")
             return
 
@@ -1253,21 +1416,21 @@ class Agent:
         if git_ref:
             if not _PINNED_GIT_REF.fullmatch(git_ref) or ".." in git_ref:
                 logger.error("Refusing update: invalid git_ref %r", git_ref)
-                await self._send_update_notice("Remote update refused: invalid git ref.")
+                await self._update_failed("Remote update refused: invalid git ref.")
                 await self._send_ws_log("Invalid git ref. Update aborted.")
                 return
             await self._send_ws_log(f"Fetching pinned ref {git_ref}...")
             if re.fullmatch(r"[0-9a-f]{40}", git_ref):
                 code, _out, err = await self._run_exec(["git", "fetch", "origin"])
                 if code != 0:
-                    await self._send_update_notice("Remote update failed during git fetch.")
+                    await self._update_failed("Remote update failed during git fetch.")
                     await self._send_ws_log("Git fetch failed. Update aborted.")
                     return
                 code, _out, err = await self._run_exec(
                     ["git", "rev-parse", "--verify", f"{git_ref}^{{commit}}"]
                 )
                 if code != 0:
-                    await self._send_update_notice("Pinned commit is not in the fetched history.")
+                    await self._update_failed("Pinned commit is not in the fetched history.")
                     await self._send_ws_log("Pinned commit was not found. Update aborted.")
                     return
                 code, _out, err = await self._run_exec(["git", "checkout", "--detach", git_ref])
@@ -1275,7 +1438,7 @@ class Agent:
                 tag_ref = git_ref if git_ref.startswith("refs/tags/") else f"refs/tags/{git_ref}"
                 code, _out, err = await self._run_exec(["git", "fetch", "origin", tag_ref])
                 if code != 0:
-                    await self._send_update_notice("Remote update failed during git fetch.")
+                    await self._update_failed("Remote update failed during git fetch.")
                     await self._send_ws_log("Git fetch failed. Update aborted.")
                     return
                 code, _out, err = await self._run_exec(["git", "checkout", "--detach", "FETCH_HEAD"])
@@ -1303,7 +1466,7 @@ class Agent:
 
         if code != 0:
             logger.error("Git update failed (%s): %s", code, (err or "").strip())
-            await self._send_update_notice("Remote update failed during git update.")
+            await self._update_failed("Remote update failed during git update.")
             await self._send_ws_log("Git update failed. Update aborted.")
             return
 
@@ -1315,13 +1478,13 @@ class Agent:
             code, _out, err = await self._run_exec([pip, "install", "-r", str(requirements)])
             if code != 0:
                 logger.error("pip install failed (%s): %s", code, (err or "").strip())
-                await self._send_update_notice("Remote update failed during pip install.")
+                await self._update_failed("Remote update failed during pip install.")
                 await self._send_ws_log("pip install failed. Update aborted.")
                 return
         code, _out, err = await self._run_exec([pip, "install", "-U", "yt-dlp[default]"])
         if code != 0:
             logger.error("yt-dlp upgrade failed (%s): %s", code, (err or "").strip())
-            await self._send_update_notice("Remote update failed while upgrading yt-dlp.")
+            await self._update_failed("Remote update failed while upgrading yt-dlp.")
             await self._send_ws_log("yt-dlp upgrade failed. Update aborted.")
             return
 
@@ -1334,6 +1497,8 @@ class Agent:
             return
 
         await self._send_update_notice("Restarting...")
+        self.ops.update_restarting(command, git_ref)
+        await self.flush_ws(3.0)
         await asyncio.sleep(2)
         try:
             os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -1361,6 +1526,8 @@ class Agent:
             )
 
     async def _send_ws_log(self, message: str) -> None:
+        if self._update_command is not None:
+            await self.ops.update_progress(self._update_command, "update", message)
         if self.ws_client and self.ws_client.connected:
             await self.ws_client.send(
                 {
@@ -1394,7 +1561,10 @@ class Agent:
                 # Backup last_seen for the dashboard when WS is quiet/wedged.
                 await asyncio.sleep(30)
                 status = await self.player.get_status()
-                response = await self.client.send_heartbeat(self._build_heartbeat(status))
+                heartbeat = self._build_heartbeat(status)
+                if self._last_health and not (self.ws_client and self.ws_client.connected):
+                    heartbeat["health"] = self._last_health
+                response = await self.client.send_heartbeat(heartbeat)
                 # The heartbeat endpoint drains the server-side pending queue, so
                 # anything it returns has already been removed there. Ignoring the
                 # response silently loses commands queued while the WS was down.
