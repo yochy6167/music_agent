@@ -43,7 +43,7 @@ DEFAULT_TIMEOUT = 45
 ACTIONS = (
     "bt_scan", "bt_pair_connect", "bt_forget", "set_output", "set_volume", "test_tone",
     "restart_player", "reboot", "wifi_scan", "wifi_connect", "wifi_forget",
-    "collect_logs", "diagnose", "identify",
+    "collect_logs", "diagnose", "identify", "audio_meter",
 )
 
 
@@ -109,6 +109,8 @@ def validate(action: str, params: Optional[dict]) -> Dict[str, Any]:
         return {"lines": _int(params, "lines", 200, 10, 1000), "units": list(dict.fromkeys(units))}
     if action == "identify":
         return {"seconds": _int(params, "seconds", 30, 5, 120)}
+    if action == "audio_meter":
+        return {"seconds": _int(params, "seconds", 60, 5, 120)}
     if action in ACTIONS:
         return {}
     raise OpError("unknown_action", f"פעולה לא מוכרת: {action}")
@@ -318,6 +320,11 @@ class DeviceOps:
             return {"ok": all(c["ok"] for c in checks), "checks": checks}
         if action == "identify":
             return await identify_led(params["seconds"])
+        if action == "audio_meter":
+            try:
+                return await self.agent.levels.stream(params["seconds"], self.agent.send_ws)
+            except RuntimeError as exc:
+                raise OpError("audio_unavailable", "אין פלט שמע למדוד.", str(exc))
         if action == "restart_player":
             await self.send_result(command_id, "ok", message="הנגן מופעל מחדש")
             await self.agent.restart_process("restart requested from the dashboard")

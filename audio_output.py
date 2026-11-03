@@ -102,6 +102,7 @@ class OutputManager:
         self.last_error: Optional[str] = None
         self.default_sink: Optional[str] = None
         self.sink_volume: Optional[int] = None
+        self.sink_muted: Optional[bool] = None
         self._volume_set_on: Optional[str] = None
         self._failures = 0
         self._task: Optional[asyncio.Task] = None
@@ -132,14 +133,18 @@ class OutputManager:
                 self._save()
                 logger.info("Imported Bluetooth speaker %s from %s", self.state["bt_mac"], LEGACY_SPEAKER_CONF)
         if self.mode:
-            probe = await run(["systemctl", "is-enabled", LEGACY_SERVICE], timeout=5)
-            active = await run(["systemctl", "is-active", LEGACY_SERVICE], timeout=5)
-            if probe.out.strip() in ("enabled", "enabled-runtime") or active.out.strip() == "active":
-                result = await run_sudo(["systemctl", "disable", "--now", LEGACY_SERVICE], timeout=20)
-                if result.ok:
-                    logger.info("Disabled %s: the agent keeps the speaker now", LEGACY_SERVICE)
-                else:
-                    logger.warning("Could not disable %s: %s", LEGACY_SERVICE, result.text)
+            await self._disable_legacy_service()
+
+    async def _disable_legacy_service(self) -> None:
+        """Once the agent manages the output, bt-keep.service must stop: two keepers fight."""
+        probe = await run(["systemctl", "is-enabled", LEGACY_SERVICE], timeout=5)
+        active = await run(["systemctl", "is-active", LEGACY_SERVICE], timeout=5)
+        if probe.out.strip() in ("enabled", "enabled-runtime") or active.out.strip() == "active":
+            result = await run_sudo(["systemctl", "disable", "--now", LEGACY_SERVICE], timeout=20)
+            if result.ok:
+                logger.info("Disabled %s: the agent keeps the speaker now", LEGACY_SERVICE)
+            else:
+                logger.warning("Could not disable %s: %s", LEGACY_SERVICE, result.text)
 
     async def start(self) -> None:
         self._load()
@@ -181,6 +186,7 @@ class OutputManager:
             await self.apply_output()
         else:
             self.default_sink = await self.get_default_sink()
+            self._read_sink(await self.list_sinks())
         if before != (self.connected, self.default_sink, self.last_error):
             self._changed()
 
@@ -229,7 +235,8 @@ class OutputManager:
                         except (ValueError, AttributeError):
                             pass
                         break
-                    sinks.append({"name": sink.get("name"), "available": available, "volume": volume})
+                    sinks.append({"name": sink.get("name"), "available": available, "volume": volume,
+                                  "mute": bool(sink.get("mute"))})
                 return sinks
             except (ValueError, TypeError):
                 pass
@@ -238,7 +245,7 @@ class OutputManager:
         for line in result.out.splitlines():
             parts = line.split("\t")
             if len(parts) > 1:
-                sinks.append({"name": parts[1], "available": True, "volume": None})
+                sinks.append({"name": parts[1], "available": True, "volume": None, "mute": None})
         return sinks
 
     async def get_default_sink(self) -> Optional[str]:
@@ -285,11 +292,18 @@ class OutputManager:
             volume = int(self.state.get("sink_volume") or DEFAULT_SINK_VOLUME)
             if (await run(["pactl", "set-sink-volume", current, f"{volume}%"], timeout=5)).ok:
                 self._volume_set_on = current
+                # The list above was read before this change
+                for sink in sinks:
+                    if sink.get("name") == current:
+                        sink["volume"] = volume
         self.default_sink = current
-        for sink in sinks:
-            if sink.get("name") == current:
-                self.sink_volume = sink.get("volume")
+        self._read_sink(sinks)
         return current
+
+    def _read_sink(self, sinks: List[Dict[str, Any]]) -> None:
+        for sink in sinks:
+            if sink.get("name") == self.default_sink:
+                self.sink_volume, self.sink_muted = sink.get("volume"), sink.get("mute")
 
     # ------------------------------------------------------------ bluetooth
 
@@ -425,6 +439,7 @@ class OutputManager:
             self.connected, self.connected_since, self.last_error, self._failures = True, time.time(), None, 0
             self._volume_set_on = None
             current = await self.apply_output()
+        await self._disable_legacy_service()
         self._changed()
         return {"connected": True, "name": self.state["bt_name"], "mac": mac, "sink": current}
 
@@ -456,6 +471,7 @@ class OutputManager:
             self.state.setdefault("sink_volume", DEFAULT_SINK_VOLUME)
             self._save()
             await self.tick()
+        await self._disable_legacy_service()
         self._changed()
         return {"mode": mode, "sink": self.default_sink, "kind": sink_kind(self.default_sink)}
 
@@ -473,7 +489,7 @@ class OutputManager:
         return {"volume": volume, "sink": self.default_sink}
 
     async def test_tone(self) -> Dict[str, Any]:
-        path = Path("/tmp/soundops_test_tone.wav")
+        path = Path("/tmp/soundops_test_tone_1k.wav")
         if not path.exists():
             _write_tone(path)
         sink = await self.get_default_sink()
@@ -500,11 +516,12 @@ class OutputManager:
                 "default_sink": self.default_sink,
                 "sink_kind": sink_kind(self.default_sink),
                 "sink_volume": self.sink_volume,
+                "sink_muted": self.sink_muted,
             },
         }
 
 
-def _write_tone(path: Path, seconds: float = 2.0, freq: float = 660.0) -> None:
+def _write_tone(path: Path, seconds: float = 2.0, freq: float = 1000.0) -> None:
     rate = 44100
     frames = bytearray()
     total = int(rate * seconds)

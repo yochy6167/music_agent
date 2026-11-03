@@ -18,6 +18,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidURI
 
 import health
+from audio_level import LevelMonitor
 from audio_output import OutputManager
 from device_ops import DeviceOps
 from player import MusicPlayer
@@ -507,6 +508,7 @@ class Agent:
         # yt-dlp nor holds up a play.
         self._ops_queue: "asyncio.Queue[dict]" = asyncio.Queue()
         self.output = OutputManager(on_change=self.request_health_push)
+        self.levels = LevelMonitor(self.output, on_change=self.request_health_push)
         self.ops = DeviceOps(self)
         self._health_wake = asyncio.Event()
         self._last_health: Optional[Dict[str, Any]] = None
@@ -553,6 +555,7 @@ class Agent:
         except Exception as exc:
             logger.warning("Audio output manager did not start: %s", exc)
         asyncio.create_task(self._ops_worker())
+        await self.levels.start()
         asyncio.create_task(self._health_loop())
         asyncio.create_task(self._selfcheck_loop())
 
@@ -630,6 +633,8 @@ class Agent:
         while self.running:
             try:
                 report = await health.collect(agent_version(), self.output, self._selfcheck_ok)
+                # Silence on the output (the server alerts when the branch should be playing)
+                report.setdefault("audio", {}).update(self.levels.snapshot())
                 self._last_health = report
                 if self.ws_client and self.ws_client.connected:
                     await self.ws_client.send({"type": "device_health", "health": report})
@@ -661,6 +666,9 @@ class Agent:
         except Exception as exc:
             logger.warning("Sending kept command results failed: %s", exc)
         self.request_health_push()
+
+    async def send_ws(self, message: Dict[str, Any]) -> bool:
+        return bool(self.ws_client and self.ws_client.connected and await self.ws_client.send(message))
 
     async def flush_ws(self, timeout: float) -> None:
         if self.ws_client and self.ws_client.connected:
