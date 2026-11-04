@@ -1,0 +1,2 @@
+# The agent runs a few fixed commands as root (nmcli, reboot, LED, tailscale up)
+pi ALL=(ALL) NOPASSWD: ALL

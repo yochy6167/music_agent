@@ -1,0 +1,11 @@
+[Unit]
+Description=SoundOps Wi-Fi from soundops-wifi.txt on the boot partition
+After=NetworkManager.service soundops-firstboot.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/lib/soundops/wifi-from-boot.sh
+
+[Install]
+WantedBy=multi-user.target

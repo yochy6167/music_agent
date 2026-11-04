@@ -1,0 +1,11 @@
+[Unit]
+Description=Update yt-dlp every week
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=1h
+Unit=music-agent-ytdlp-update.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=SoundOps first boot (hostname, SSH host keys, claim secret)
+# Before the network: the router and the dashboard see soundops-xxxxxx from the start
+DefaultDependencies=no
+After=local-fs.target systemd-remount-fs.service regenerate_ssh_host_keys.service
+Before=network-pre.target NetworkManager.service ssh.service avahi-daemon.service music_agent.service sysinit.target
+Wants=network-pre.target
+ConditionPathExists=!/etc/soundops/provisioned
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash /usr/local/lib/soundops/firstboot.sh
+
+[Install]
+WantedBy=sysinit.target

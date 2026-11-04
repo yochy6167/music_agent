@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import tailscale_ops
 from oscmd import SYSTEM_DIR, read_json, run
 from net_ops import band, split_terse
 
@@ -118,7 +119,9 @@ async def network() -> Dict[str, Any]:
 
 
 async def collect(agent_version: str, output: Any, selfcheck_ok: Optional[bool]) -> Dict[str, Any]:
-    throttled, clock, net = await asyncio.gather(_throttled(), _clock_synced(), network())
+    throttled, clock, net, tailscale = await asyncio.gather(
+        _throttled(), _clock_synced(), network(), tailscale_ops.status()
+    )
     report: Dict[str, Any] = {
         "agent_version": agent_version,
         "image_version": image_version(),
@@ -129,6 +132,7 @@ async def collect(agent_version: str, output: Any, selfcheck_ok: Optional[bool])
         "mem_used_pct": _mem_used_pct(),
         "clock_synced": clock,
         "network": net,
+        "tailscale": tailscale,
         "selfcheck_ok": selfcheck_ok,
         "collected_at": int(time.time()),
     }

@@ -1,0 +1,10 @@
+[Unit]
+Description=Reboot music agent Pi every night at midnight
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+Persistent=true
+Unit=music-agent-nightly-reboot.service
+
+[Install]
+WantedBy=timers.target

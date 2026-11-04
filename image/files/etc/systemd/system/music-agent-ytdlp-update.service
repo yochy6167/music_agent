@@ -1,0 +1,8 @@
+[Unit]
+Description=Weekly yt-dlp update for Neeman Music Agent
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/home/pi/music_agent
+ExecStart=/home/pi/music_agent/.venv/bin/pip install -U yt-dlp[default]

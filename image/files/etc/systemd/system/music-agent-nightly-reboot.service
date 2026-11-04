@@ -1,0 +1,6 @@
+[Unit]
+Description=Nightly reboot for Neeman Music Agent Pi
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl reboot

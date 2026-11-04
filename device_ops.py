@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 import health
 import net_ops
+import tailscale_ops
 from audio_output import BtError
 from oscmd import STATE_DIR, needs_password, read_json, run, run_sudo, write_json_atomic
 
@@ -36,14 +37,14 @@ LED_DIRS = (Path("/sys/class/leds/ACT"), Path("/sys/class/leds/led0"))
 # The longest each action may run on the Pi
 TIMEOUTS = {
     "bt_scan": 80, "bt_pair_connect": 140, "wifi_connect": 170, "wifi_scan": 45,
-    "collect_logs": 60, "diagnose": 60,
+    "collect_logs": 60, "diagnose": 60, "tailscale_join": tailscale_ops.JOIN_TIMEOUT_S + 10,
 }
 DEFAULT_TIMEOUT = 45
 
 ACTIONS = (
     "bt_scan", "bt_pair_connect", "bt_forget", "set_output", "set_volume", "test_tone",
     "restart_player", "reboot", "wifi_scan", "wifi_connect", "wifi_forget",
-    "collect_logs", "diagnose", "identify", "audio_meter",
+    "collect_logs", "diagnose", "identify", "audio_meter", "tailscale_join",
 )
 
 
@@ -111,6 +112,11 @@ def validate(action: str, params: Optional[dict]) -> Dict[str, Any]:
         return {"seconds": _int(params, "seconds", 30, 5, 120)}
     if action == "audio_meter":
         return {"seconds": _int(params, "seconds", 60, 5, 120)}
+    if action == "tailscale_join":
+        key, hostname = tailscale_ops.valid_key(params.get("auth_key")), tailscale_ops.valid_hostname(params.get("hostname"))
+        if not key or not hostname:
+            raise OpError("invalid_params", "מפתח או שם Tailscale לא תקינים")
+        return {"auth_key": key, "hostname": hostname}
     if action in ACTIONS:
         return {}
     raise OpError("unknown_action", f"פעולה לא מוכרת: {action}")
@@ -325,6 +331,13 @@ class DeviceOps:
                 return await self.agent.levels.stream(params["seconds"], self.agent.send_ws)
             except RuntimeError as exc:
                 raise OpError("audio_unavailable", "אין פלט שמע למדוד.", str(exc))
+        if action == "tailscale_join":
+            try:
+                data = await tailscale_ops.join(params["auth_key"], params["hostname"], progress)
+            except tailscale_ops.TailscaleError as exc:
+                raise OpError(exc.code, exc.message, exc.detail)
+            self.agent.request_health_push()
+            return data
         if action == "restart_player":
             await self.send_result(command_id, "ok", message="הנגן מופעל מחדש")
             await self.agent.restart_process("restart requested from the dashboard")

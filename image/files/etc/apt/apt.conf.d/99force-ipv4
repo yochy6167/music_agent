@@ -1,0 +1,2 @@
+// Some shop networks have broken IPv6 and apt hangs on it
+Acquire::ForceIPv4 "true";
