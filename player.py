@@ -108,6 +108,8 @@ class MusicPlayer:
         self.ad_player = None
         self._ad_overlay_mode = "duck"
         self._ad_pre_music_volume: Optional[int] = None
+        # A schedule's volume change glides instead of jumping (see set_volume)
+        self._volume_fade_task: Optional[asyncio.Task] = None
         self._ad_saved_position_ms: Optional[int] = None
         self._ad_after_finish_action: Optional[str] = None
         self._ad_campaign_name: Optional[str] = None
@@ -472,8 +474,21 @@ class MusicPlayer:
             "stream": True,
         }
 
-    async def set_volume(self, volume: float) -> None:
+    async def set_volume(self, volume: float, fade_seconds: float = 0.0) -> None:
+        """The music volume. ``fade_seconds``: glide there (a schedule's change), else at once."""
+        if self._volume_fade_task and not self._volume_fade_task.done():
+            self._volume_fade_task.cancel()
+        start = self._vlc_software_volume()
         self.volume = float(volume)
+        if (
+            fade_seconds > 0 and self.player and not self._ad_playing and not self._warming_up
+            and start is not None and start != int(self.volume)
+        ):
+            self._volume_fade_task = asyncio.create_task(
+                self._fade_music_volume(self.player, start, int(self.volume), min(float(fade_seconds), 30.0))
+            )
+            self._persist_playback_state()
+            return
         if self._ad_playing:
             # The music is ducked or paused under the ad: change the level it
             # returns to afterwards, not the music now (that undid the duck).
@@ -483,6 +498,20 @@ class MusicPlayer:
         if self.ad_player and self._ad_playing:
             self._force_ad_player_volume(int(self.volume))
         self._persist_playback_state()
+
+    async def _fade_music_volume(self, player: Any, start: int, end: int, seconds: float) -> None:
+        """Step the music from start to end; an ad, a new track or a newer change takes over."""
+        steps = max(int(seconds * 10), 1)
+        try:
+            for step in range(1, steps + 1):
+                if self._ad_playing or player is not self.player:
+                    return
+                player.audio_set_volume(max(0, min(100, int(round(start + (end - start) * step / steps)))))
+                await asyncio.sleep(seconds / steps)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("Volume fade stopped: %s", exc)
 
     def _vlc_software_volume(self) -> Optional[int]:
         """What libvlc is actually mixing, not the dashboard-facing self.volume."""

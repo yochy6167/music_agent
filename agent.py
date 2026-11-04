@@ -508,7 +508,9 @@ class Agent:
         # yt-dlp nor holds up a play.
         self._ops_queue: "asyncio.Queue[dict]" = asyncio.Queue()
         self.output = OutputManager(on_change=self.request_health_push)
-        self.levels = LevelMonitor(self.output, on_change=self.request_health_push)
+        self.levels = LevelMonitor(
+            self.output, on_change=self.request_health_push, volume=lambda: self.player.volume
+        )
         self.ops = DeviceOps(self)
         self._health_wake = asyncio.Event()
         self._last_health: Optional[Dict[str, Any]] = None
@@ -1266,7 +1268,11 @@ class Agent:
     async def _handle_volume_control(self, command: dict) -> None:
         volume = command.get("volume")
         if volume is not None:
-            await self.player.set_volume(volume)
+            try:
+                fade = float(command.get("fade_seconds") or 0)
+            except (TypeError, ValueError):
+                fade = 0.0
+            await self.player.set_volume(volume, fade_seconds=fade)
             # Non-blocking: queue a slim status update (sender coalesces duplicates).
             await self._push_status_update()
             logger.info("Volume set to %s", volume)

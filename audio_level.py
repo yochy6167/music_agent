@@ -33,8 +33,12 @@ _BAND_COEFFS = [
 ]
 _HANN = [0.5 - 0.5 * math.cos(2 * math.pi * i / (BAND_WINDOW - 1)) for i in range(BAND_WINDOW)]
 
-# Below this (dBFS) a frame is silence; the quiet end of a song is well under it
+# At full player volume, below this (dBFS) a frame is silence. The player's
+# volume is cubic (music measured -19 dB at 80 and -50 dB at 20), so the
+# threshold follows it down to -90 dB (true silence is -96); same rule as the
+# server's alerts (device_monitor.silence_threshold_db).
 SILENCE_DB = -50.0
+SILENCE_FLOOR_DB = -90.0
 SAMPLE_EVERY_S = 30
 SAMPLE_SECONDS = 3
 STREAM_MAX_S = 120
@@ -42,11 +46,22 @@ STREAM_MAX_S = 120
 Send = Callable[[Dict[str, Any]], Awaitable[Any]]
 
 
+def silence_threshold_db(volume: Optional[float]) -> float:
+    v = 100.0 if volume is None else max(0.0, min(float(volume), 100.0))
+    if v <= 0:
+        return SILENCE_FLOOR_DB
+    return max(SILENCE_FLOOR_DB, SILENCE_DB + 60.0 * math.log10(v / 100.0))
+
+
 def analyse(samples: "array.array") -> Dict[str, Any]:
-    """Level (dBFS), peak (0–1) and 8 bands (0–1, from -60 dB to 0 dB) of one frame."""
+    """Level (dBFS), peak (0–1) and 8 bands of one frame.
+
+    ``bands``: 0–1 over -60..0 dB (older dashboards); ``bands_db``: the plain dB,
+    so a page can scale them to the frame (music at volume 20 sits under -60).
+    """
     n = len(samples)
     if not n:
-        return {"rms_db": -96.0, "peak": 0.0, "bands": [0.0] * len(BANDS_HZ)}
+        return {"rms_db": -96.0, "peak": 0.0, "bands": [0.0] * len(BANDS_HZ), "bands_db": [-96.0] * len(BANDS_HZ)}
     power = sum(x * x for x in samples) / n
     rms = math.sqrt(power) / 32768
     peak = max(abs(max(samples)), abs(min(samples))) / 32768
@@ -54,6 +69,7 @@ def analyse(samples: "array.array") -> Dict[str, Any]:
     window = [x * w for x, w in zip(samples[-BAND_WINDOW:], weights)]
     scale = (len(window) / 4) * 32768  # a full-scale sine gives about 1 after the Hann window
     bands: List[float] = []
+    bands_db: List[float] = []
     for coeffs in _BAND_COEFFS:
         best = 0.0
         for coeff in coeffs:
@@ -65,10 +81,12 @@ def analyse(samples: "array.array") -> Dict[str, Any]:
         magnitude = math.sqrt(best) / scale
         db = 20 * math.log10(magnitude) if magnitude > 0 else -96.0
         bands.append(round(min(1.0, max(0.0, (db + 60) / 60)), 3))
+        bands_db.append(round(max(db, -96.0), 1))
     return {
         "rms_db": round(20 * math.log10(rms), 1) if rms > 0 else -96.0,
         "peak": round(min(peak, 1.0), 3),
         "bands": bands,
+        "bands_db": bands_db,
     }
 
 
@@ -99,9 +117,15 @@ async def frames(sink: str, seconds: float) -> AsyncIterator["array.array"]:
 
 
 class LevelMonitor:
-    def __init__(self, output: Any, on_change: Optional[Callable[[], None]] = None) -> None:
+    def __init__(
+        self,
+        output: Any,
+        on_change: Optional[Callable[[], None]] = None,
+        volume: Optional[Callable[[], Optional[float]]] = None,
+    ) -> None:
         self.output = output
         self.on_change = on_change
+        self._volume = volume or (lambda: None)
         self.silent_since: Optional[float] = None
         self.level_db: Optional[float] = None
         self.measured_at: Optional[float] = None
@@ -123,7 +147,7 @@ class LevelMonitor:
             loudest_db = -96.0
         was_silent = self.silent_since is not None
         self.level_db, self.measured_at = round(loudest_db, 1), time.time()
-        if loudest_db < SILENCE_DB:
+        if loudest_db < silence_threshold_db(self._volume()):
             self.silent_since = self.silent_since or started
         else:
             self.silent_since = None
@@ -173,7 +197,12 @@ class LevelMonitor:
             async for frame in frames(sink, seconds):
                 result = analyse(frame)
                 loudest = max(loudest, result["rms_db"])
-                await send({"type": "audio_level", **result})
+                await send({
+                    "type": "audio_level", **result,
+                    # The monitor is before the sink volume: say when nothing reaches the speaker
+                    "muted": bool(self.output.sink_muted or self.output.sink_volume == 0),
+                    "volume": self._volume(),
+                })
                 if time.time() - second_start >= SAMPLE_SECONDS:
                     self._note(loudest, second_start)
                     second_start, loudest = time.time(), -96.0
