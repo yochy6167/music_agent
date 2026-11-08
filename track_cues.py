@@ -230,10 +230,17 @@ async def analyze(url: str, duration_hint: Optional[float]) -> Optional[Dict[str
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="soundops-cue-") as tmp:
         head_wav, tail_wav = Path(tmp) / "head.wav", Path(tmp) / "tail.wav"
+        async def decode(dst: Path, start: float, stop: Optional[float]) -> bool:
+            # One retry: a stream read now and then fails at once (seen twice in a day on the VM).
+            if await _decode(vlc, url, dst, start, stop):
+                return True
+            await asyncio.sleep(3.0)
+            return await _decode(vlc, url, dst, start, stop)
+
         try:
-            ok_head = await _decode(vlc, url, head_wav, 0.0, HEAD_S)
+            ok_head = await decode(head_wav, 0.0, HEAD_S)
             # No stop-time: decode to the real end, which is what the end is measured from.
-            ok_tail = ok_head and await _decode(vlc, url, tail_wav, max(0.0, duration - TAIL_S), None)
+            ok_tail = ok_head and await decode(tail_wav, max(0.0, duration - TAIL_S), None)
         except asyncio.TimeoutError:
             logger.warning("Silence analysis timed out")
             return None
