@@ -11,7 +11,9 @@ How, without ffmpeg (players don't have it; VLC is always installed):
   mono WAV, niced, in its own process. Measured on a desktop: ~0.25s each
   (about 100x real time); a Pi 4 is several times slower, a few seconds in
   all, once per song, while the song before it plays.
-- Pure Python finds the first and last 50ms window above -55 dBFS. The end is
+- Pure Python finds the first and last 50ms window that is no more than 30 dB
+  under the song's own loudness (and above -55 dBFS). A fade-out deep under the
+  music sounds like silence in a store, so it is cut too. The end is
   measured from the end of the decoded audio, because a seek in an m4a lands
   up to ~2s early (measured), and the exact length comes from the stream URL
   (``dur=`` parameter).
@@ -40,12 +42,15 @@ from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 
-VERSION = 1
+# 2: edges relative to the song's own loudness (inaudible fade-outs are cut too).
+# A newer version replaces older cues, locally and on the server.
+VERSION = 2
 HEAD_S = 20.0
 TAIL_S = 30.0
 RATE = 8000
 WINDOW_S = 0.05
-THRESHOLD_DB = -55.0
+THRESHOLD_DB = -55.0  # absolute floor: always silence below this
+RELATIVE_DB = 30.0  # ...and so is anything this far under the song's body
 MIN_LEAD_S = 0.4  # shorter silences are not worth a cut
 MIN_TAIL_S = 0.6
 KEEP_BEFORE_S = 0.05  # start a hair before the first sound
@@ -101,10 +106,28 @@ def window_levels(samples: array.array, rate: int = RATE, window_s: float = WIND
     return out
 
 
+def body_level(levels: list) -> Optional[float]:
+    """How loud the song itself is in a section: the 80th percentile of its sound windows."""
+    sound = sorted(v for v in levels if v > THRESHOLD_DB)
+    if len(sound) < 20:  # under a second of sound: no reliable body
+        return None
+    return sound[int(len(sound) * 0.8)]
+
+
+def edge_threshold(levels: list) -> float:
+    """Below this a song's edge counts as silence: RELATIVE_DB under the song's own body,
+    never lower than THRESHOLD_DB. A store hears a fade 30 dB under the music as
+    silence (measured at the speaker on the VM: a 3.5s fade-out left a 2.5s "hole"
+    with the absolute threshold alone)."""
+    body = body_level(levels)
+    return THRESHOLD_DB if body is None else max(THRESHOLD_DB, body - RELATIVE_DB)
+
+
 def find_cue(head: list, tail: list, duration_s: float) -> Optional[Dict[str, Any]]:
     """{start_s, end_s, lead_s, tail_s} from window levels, or None when unclear."""
-    loud_head = next((i for i, v in enumerate(head) if v > THRESHOLD_DB), None)
-    loud_tail = next((i for i in range(len(tail) - 1, -1, -1) if tail[i] > THRESHOLD_DB), None)
+    head_thr, tail_thr = edge_threshold(head), edge_threshold(tail)
+    loud_head = next((i for i, v in enumerate(head) if v > head_thr), None)
+    loud_tail = next((i for i in range(len(tail) - 1, -1, -1) if tail[i] > tail_thr), None)
     if loud_head is None or loud_tail is None or duration_s <= HEAD_S + TAIL_S:
         return None
     lead = loud_head * WINDOW_S
