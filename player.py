@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import platform
 import random
@@ -160,6 +161,10 @@ class MusicPlayer:
         self._silence_trim = os.environ.get("SILENCE_TRIM", "1").strip().lower() not in ("0", "false", "no")
         self.cues = track_cues.CueStore(self.cache_dir.parent / "track_cues.json")
         self._cue_task: Optional[asyncio.Task] = None
+        # (end_s, fade_s) actually put on each track's media (by cache key): a song
+        # fades out only when its media really stops at end_s.
+        self._applied_stop: Dict[str, tuple] = {}
+        self._tail_fade_task: Optional[asyncio.Task] = None
         # {"key": cache key of the waiting track, "player": the standby player}
         self._preloaded: Optional[dict] = None
         self._preload_task: Optional[asyncio.Task] = None
@@ -1349,17 +1354,17 @@ class MusicPlayer:
             self._schedule_cue_analysis(track, media_url)
 
     def _cue_for(self, track: Optional[Dict[str, Any]]) -> Optional[tuple]:
-        """(start_s, end_s or None) where the song's music is, when it was measured."""
+        """(start_s, end_s or None, fade_s) where the song's music is, when it was measured."""
         if not self._silence_trim or not track or track.get("source") != "youtube":
             return None
         server = None
         if track.get("play_start_s") is not None:
-            server = (float(track["play_start_s"]), track.get("play_end_s"))
+            server = (float(track["play_start_s"]), track.get("play_end_s"), float(track.get("play_fade_s") or 0.0))
             if self._server_cue_current(track):
                 return server
         local = self.cues.get(track.get("source_id"))
         if local:
-            return float(local.get("s") or 0.0), local.get("e")
+            return float(local.get("s") or 0.0), local.get("e"), float(local.get("f") or 0.0)
         # An older analyzer's cue still beats none until the song is measured again.
         return server
 
@@ -1387,14 +1392,19 @@ class MusicPlayer:
             # Opens the stream and fills the buffer, then waits on the first sample.
             options.append(":start-paused")
         cue = self._cue_for(track)
+        key = self._cache_key(track) if track else None
+        if key:
+            self._applied_stop.pop(key, None)
         if cue:
             # Skip the silent edges. stop-time ends the song (EndReached) there,
             # so the switch to the next song happens where the music stops.
-            start_s, end_s = cue
+            start_s, end_s, fade_s = cue
             if start_s and start_s > 0.05:
                 options.append(f":start-time={float(start_s):.2f}")
             if end_s:
                 options.append(f":stop-time={float(end_s):.2f}")
+                if key:
+                    self._applied_stop[key] = (float(end_s), float(fade_s or 0.0))
         for opt in options:
             try:
                 media.add_option(opt)
@@ -1402,7 +1412,83 @@ class MusicPlayer:
                 pass
         return media
 
+    def _schedule_tail_fade(self) -> None:
+        """Fade the current song out into its cut end, if its media has one."""
+        if self._tail_fade_task and not self._tail_fade_task.done():
+            self._tail_fade_task.cancel()
+        track = self.current_track
+        applied = self._applied_stop.get(self._cache_key(track)) if track else None
+        if not applied or applied[1] < 0.2:
+            return
+        try:
+            self._tail_fade_task = asyncio.get_running_loop().create_task(
+                self._fade_out_tail(self.current_track_id, applied[0], applied[1])
+            )
+        except RuntimeError:
+            return
+
+    async def _fade_out_tail(self, track_id: Any, end_s: float, fade_s: float) -> None:
+        """Lower this song's own player to silence over the last fade_s before its stop-time.
+
+        The next song plays on the other player at the intended volume, so nothing
+        needs restoring after a switch. Paused, seeked, an ad, or no switch within
+        3s of the end: the volume goes back.
+        """
+        end_ms, fade_ms = end_s * 1000.0, fade_s * 1000.0
+        player = None
+        start_vol = None
+        try:
+            while True:  # wait for the fade point
+                if self.current_track_id != track_id:
+                    return
+                player = self.player
+                try:
+                    pos = int(player.get_time()) if player else -1
+                except Exception:
+                    pos = -1
+                if pos >= 0 and self._expect_playing and not self._ad_playing:
+                    remaining = end_ms - pos
+                    if remaining <= fade_ms:
+                        break
+                    await asyncio.sleep(min(1.0, max(0.05, (remaining - fade_ms) / 1000.0 - 0.05)))
+                else:
+                    await asyncio.sleep(0.5)
+            start_vol = player.audio_get_volume()
+            if not start_vol or start_vol <= 0:
+                return
+            pos_ref, t_ref = float(player.get_time()), time.monotonic()
+            logger.info("Fading out track %s over %.1fs into its cut end", track_id, (end_ms - pos_ref) / 1000.0)
+            while True:
+                if self.current_track_id != track_id or player is not self.player:
+                    return  # switched: the new song has its own volume
+                if self._ad_playing or not self._expect_playing:
+                    break  # an ad takes over the volume / paused: restore below
+                pos = pos_ref + (time.monotonic() - t_ref) * 1000.0
+                try:
+                    real = float(player.get_time())
+                except Exception:
+                    real = pos
+                if real >= 0 and abs(real - pos) > 1500:
+                    break  # a seek
+                remaining = end_ms - pos
+                if remaining <= -3000:
+                    break  # stop-time never ended it: don't leave the song silent
+                frac = max(0.0, min(1.0, remaining / fade_ms))
+                # An S-curve: starts gently, ends at silence.
+                gain = 0.5 - 0.5 * math.cos(math.pi * frac)
+                player.audio_set_volume(max(0, min(100, int(round(start_vol * gain)))))
+                await asyncio.sleep(0.05)
+            if player is self.player and not self._ad_playing:
+                self._apply_intended_volume()
+        except asyncio.CancelledError:
+            if player is not None and player is self.player and start_vol and not self._ad_playing:
+                self._apply_intended_volume()
+            raise
+        except Exception as exc:
+            logger.debug("Tail fade stopped: %s", exc)
+
     def _schedule_preload(self) -> None:
+        self._schedule_tail_fade()
         if not self._gapless or not self._standby_player:
             return
         if self._preload_task and not self._preload_task.done():
@@ -1878,11 +1964,11 @@ class MusicPlayer:
         if cue is None:
             logger.info("Silence analysis: nothing measurable for track %s", track.get("id"))
             return
-        self.cues.put(source_id, cue["start_s"], cue["end_s"], cue["duration_s"])
+        self.cues.put(source_id, cue["start_s"], cue["end_s"], cue["duration_s"], cue.get("fade_s") or 0.0)
         end_text = f"{cue['end_s']:.2f}" if cue["end_s"] else "end"
         logger.info(
-            "Silence cues for track %s: %.2fs silent at the start, %.2fs at the end -> play %.2f..%s (took %.1fs)",
-            track.get("id"), cue["lead_s"], cue["tail_s"], cue["start_s"], end_text, cue["took_s"],
+            "Silence cues for track %s: %.2fs silent at the start, %.2fs at the end -> play %.2f..%s (took %.1fs, fade %.1fs)",
+            track.get("id"), cue["lead_s"], cue["tail_s"], cue["start_s"], end_text, cue["took_s"], cue.get("fade_s") or 0.0,
         )
         # Share it: the server hands it to every player with the playlist.
         try:
@@ -1895,6 +1981,7 @@ class MusicPlayer:
                         "duration_s": cue["duration_s"],
                         "start_s": cue["start_s"],
                         "end_s": cue["end_s"],
+                        "fade_s": cue.get("fade_s") or 0.0,
                         "version": track_cues.VERSION,
                     },
                 )

@@ -44,14 +44,20 @@ logger = logging.getLogger(__name__)
 
 # 2: edges relative to the song's own loudness (inaudible fade-outs are cut too).
 # 3: that loudness is the louder of the start and the end (soft outros).
+# 4: the end is cut 25 dB under the song, with a fade-out (fade_s) instead of a hard stop.
 # A newer version replaces older cues, locally and on the server.
-VERSION = 3
+VERSION = 4
 HEAD_S = 20.0
 TAIL_S = 30.0
 RATE = 8000
 WINDOW_S = 0.05
 THRESHOLD_DB = -55.0  # absolute floor: always silence below this
-RELATIVE_DB = 30.0  # ...and so is anything this far under the song's body
+RELATIVE_DB = 30.0  # ...and so is anything this far under the song's body (the start)
+# The end is cut closer to the music: the player fades out into the cut (fade_s),
+# so a slow fade-out ends sooner without stopping abruptly.
+RELATIVE_DB_END = 25.0
+FULL_DB = 10.0  # within this of the body the song still plays at full level
+MAX_FADE_S = 2.0
 MIN_LEAD_S = 0.4  # shorter silences are not worth a cut
 MIN_TAIL_S = 0.6
 KEEP_BEFORE_S = 0.05  # start a hair before the first sound
@@ -115,7 +121,13 @@ def body_level(levels: list) -> Optional[float]:
     return sound[int(len(sound) * 0.8)]
 
 
-def edge_threshold(*sections: list) -> float:
+def song_body(*sections: list) -> Optional[float]:
+    """The song's loudness: the louder body of the given sections."""
+    bodies = [b for b in (body_level(s) for s in sections) if b is not None]
+    return max(bodies) if bodies else None
+
+
+def edge_threshold(*sections: list, relative_db: float = RELATIVE_DB) -> float:
     """Below this a song's edge counts as silence: RELATIVE_DB under the song's own body,
     never lower than THRESHOLD_DB. A store hears a fade 30 dB under the music as
     silence (measured at the speaker on the VM: a 3.5s fade-out left a 2.5s "hole"
@@ -124,13 +136,19 @@ def edge_threshold(*sections: list) -> float:
     The body is the louder of the given sections: a song that ends on a soft outro
     is still measured against the song, or its fade after the outro stays (measured:
     a 1.5s fade under a quiet ending left a 3s hole)."""
-    bodies = [b for b in (body_level(s) for s in sections) if b is not None]
-    return THRESHOLD_DB if not bodies else max(THRESHOLD_DB, max(bodies) - RELATIVE_DB)
+    body = song_body(*sections)
+    return THRESHOLD_DB if body is None else max(THRESHOLD_DB, body - relative_db)
 
 
 def find_cue(head: list, tail: list, duration_s: float) -> Optional[Dict[str, Any]]:
-    """{start_s, end_s, lead_s, tail_s} from window levels, or None when unclear."""
-    head_thr = tail_thr = edge_threshold(head, tail)
+    """{start_s, end_s, fade_s, lead_s, tail_s} from window levels, or None when unclear.
+
+    fade_s: how long the player fades out before end_s: from where the song
+    leaves its full level to the cut, at most MAX_FADE_S. A song that ends on a
+    hit gets a short fade that starts after the hit, so the hit stays whole.
+    """
+    head_thr = edge_threshold(head, tail)
+    tail_thr = edge_threshold(head, tail, relative_db=RELATIVE_DB_END)
     loud_head = next((i for i, v in enumerate(head) if v > head_thr), None)
     loud_tail = next((i for i in range(len(tail) - 1, -1, -1) if tail[i] > tail_thr), None)
     if loud_head is None or loud_tail is None or duration_s <= HEAD_S + TAIL_S:
@@ -139,7 +157,16 @@ def find_cue(head: list, tail: list, duration_s: float) -> Optional[Dict[str, An
     trailing = (len(tail) - loud_tail - 1) * WINDOW_S
     start_s = round(max(0.0, lead - KEEP_BEFORE_S), 2) if lead >= MIN_LEAD_S else 0.0
     end_s = round(duration_s - max(0.0, trailing - KEEP_AFTER_S), 2) if trailing >= MIN_TAIL_S else None
-    return {"start_s": start_s, "end_s": end_s, "lead_s": round(lead, 2), "tail_s": round(trailing, 2)}
+    fade_s = 0.0
+    body = song_body(head, tail)
+    if end_s is not None and body is not None:
+        full = next((i for i in range(loud_tail, -1, -1) if tail[i] > body - FULL_DB), None)
+        if full is None:
+            # The whole ending is soft (a quiet outro): fade the full length, never a hard stop.
+            fade_s = MAX_FADE_S
+        else:
+            fade_s = round(min(MAX_FADE_S, (loud_tail - full + 1) * WINDOW_S + KEEP_AFTER_S), 2)
+    return {"start_s": start_s, "end_s": end_s, "fade_s": fade_s, "lead_s": round(lead, 2), "tail_s": round(trailing, 2)}
 
 
 def _kill(proc: "asyncio.subprocess.Process") -> None:
@@ -242,8 +269,9 @@ class CueStore:
         entry = self._data.get(source_id or "")
         return entry if entry and entry.get("v", 0) >= VERSION else None
 
-    def put(self, source_id: str, start_s: float, end_s: Optional[float], duration_s: Optional[float]) -> None:
-        self._data[source_id] = {"s": start_s, "e": end_s, "d": duration_s, "v": VERSION, "t": int(time.time())}
+    def put(self, source_id: str, start_s: float, end_s: Optional[float], duration_s: Optional[float],
+            fade_s: float = 0.0) -> None:
+        self._data[source_id] = {"s": start_s, "e": end_s, "f": fade_s, "d": duration_s, "v": VERSION, "t": int(time.time())}
         if len(self._data) > _STORE_LIMIT:
             for key, _ in sorted(self._data.items(), key=lambda kv: kv[1].get("t", 0))[: len(self._data) - _STORE_LIMIT]:
                 self._data.pop(key, None)
