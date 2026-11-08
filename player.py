@@ -11,6 +11,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+import track_cues
+
 logger = logging.getLogger(__name__)
 
 
@@ -153,6 +155,11 @@ class MusicPlayer:
         # start with a muted warmup (~3s). GAPLESS=0 turns it off.
         self._gapless = os.environ.get("GAPLESS", "1").strip().lower() not in ("0", "false", "no")
         self._standby_player = None
+        # Silence trimming: play each song from where its music starts to where
+        # it ends (track_cues.py). SILENCE_TRIM=0 turns it off.
+        self._silence_trim = os.environ.get("SILENCE_TRIM", "1").strip().lower() not in ("0", "false", "no")
+        self.cues = track_cues.CueStore(self.cache_dir.parent / "track_cues.json")
+        self._cue_task: Optional[asyncio.Task] = None
         # {"key": cache key of the waiting track, "player": the standby player}
         self._preloaded: Optional[dict] = None
         self._preload_task: Optional[asyncio.Task] = None
@@ -853,6 +860,7 @@ class MusicPlayer:
         except Exception:
             length_ms = 0
         if length_ms and length_ms > 0:
+            length_ms = self._effective_length_ms(length_ms)
             target_ms = min(target_ms, max(length_ms - 1000, 0))
 
         # A seek makes VLC re-request the HTTP range, but it keeps feeding the
@@ -1219,7 +1227,7 @@ class MusicPlayer:
             await self._play_current_track_locked(_skip_depth=_skip_depth + 1)
             return
 
-        media = self._new_music_media(media_url)
+        media = self._new_music_media(media_url, track=track)
 
         # Mute while VLC fills the network buffer, so a rough start is inaudible.
         self._warming_up = True
@@ -1335,13 +1343,40 @@ class MusicPlayer:
         self._schedule_prefetch_next()
         self._schedule_preload()
 
-    def _new_music_media(self, url: str, *, start_paused: bool = False) -> Any:
+    def _cue_for(self, track: Optional[Dict[str, Any]]) -> Optional[tuple]:
+        """(start_s, end_s or None) where the song's music is, when it was measured."""
+        if not self._silence_trim or not track or track.get("source") != "youtube":
+            return None
+        if track.get("play_start_s") is not None:
+            return float(track["play_start_s"]), track.get("play_end_s")
+        local = self.cues.get(track.get("source_id"))
+        if local:
+            return float(local.get("s") or 0.0), local.get("e")
+        return None
+
+    def _effective_length_ms(self, length_ms: int) -> int:
+        """Where the current song ends when its silent tail is cut (:stop-time)."""
+        cue = self._cue_for(self.current_track)
+        if cue and cue[1] and length_ms and length_ms > 0:
+            return min(length_ms, int(float(cue[1]) * 1000))
+        return length_ms
+
+    def _new_music_media(self, url: str, *, start_paused: bool = False, track: Optional[Dict[str, Any]] = None) -> Any:
         media = self.instance.media_new(url)
         # Media-level options stick more reliably than instance flags for HTTP/DASH.
         options = [":network-caching=5000", ":file-caching=3000", ":http-reconnect", ":no-video"]
         if start_paused:
             # Opens the stream and fills the buffer, then waits on the first sample.
             options.append(":start-paused")
+        cue = self._cue_for(track)
+        if cue:
+            # Skip the silent edges. stop-time ends the song (EndReached) there,
+            # so the switch to the next song happens where the music stops.
+            start_s, end_s = cue
+            if start_s and start_s > 0.05:
+                options.append(f":start-time={float(start_s):.2f}")
+            if end_s:
+                options.append(f":stop-time={float(end_s):.2f}")
         for opt in options:
             try:
                 media.add_option(opt)
@@ -1381,6 +1416,8 @@ class MusicPlayer:
                     return
                 if not length_ms or length_ms <= 0 or pos_ms < 0:
                     continue
+                # A trimmed song ends at its stop-time, not at the stream's end.
+                length_ms = self._effective_length_ms(length_ms)
                 if length_ms - pos_ms > self.PRELOAD_LEAD_S * 1000:
                     continue
                 nxt_track = self._next_track()
@@ -1407,7 +1444,7 @@ class MusicPlayer:
         if not standby or not vlc:
             return
         await self._discard_preload(keep_task=True)
-        media = self._new_music_media(url, start_paused=True)
+        media = self._new_music_media(url, start_paused=True, track=track)
         standby.set_media(media)
         try:
             media.release()
@@ -1768,8 +1805,10 @@ class MusicPlayer:
             track = self._next_track()
             if track is None:
                 return
-            if self._get_cached_url(track):
+            cached = self._get_cached_url(track)
+            if cached:
                 logger.info("Next track %s already prefetched", track.get("id"))
+                self._schedule_cue_analysis(track, cached)
                 return
             if self._youtube_bot_blocked():
                 self._schedule_youtube_resume()
@@ -1788,12 +1827,63 @@ class MusicPlayer:
             if url:
                 self._put_cached_url(track, url)
                 logger.info("Prefetched next track %s", track.get("id"))
+                self._schedule_cue_analysis(track, url)
             else:
                 self._mark_resolve_failed(track)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("Prefetch failed: %s", exc)
+
+    def _schedule_cue_analysis(self, track: Dict[str, Any], url: str) -> None:
+        """Measure the next song's silent edges while this one plays (once per song)."""
+        if not self._silence_trim or track.get("source") != "youtube" or not track.get("source_id"):
+            return
+        if self._cue_for(track) is not None:
+            return
+        if self._cue_task and not self._cue_task.done():
+            return  # one at a time; the next prefetch tries again
+        try:
+            self._cue_task = asyncio.get_running_loop().create_task(self._analyze_cue(track, url))
+        except RuntimeError:
+            return
+
+    async def _analyze_cue(self, track: Dict[str, Any], url: str) -> None:
+        source_id = track["source_id"]
+        try:
+            cue = await track_cues.analyze(url, track.get("duration"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Silence analysis failed for track %s: %s", track.get("id"), exc)
+            return
+        if cue is None:
+            logger.info("Silence analysis: nothing measurable for track %s", track.get("id"))
+            return
+        self.cues.put(source_id, cue["start_s"], cue["end_s"], cue["duration_s"])
+        end_text = f"{cue['end_s']:.2f}" if cue["end_s"] else "end"
+        logger.info(
+            "Silence cues for track %s: %.2fs silent at the start, %.2fs at the end -> play %.2f..%s (took %.1fs)",
+            track.get("id"), cue["lead_s"], cue["tail_s"], cue["start_s"], end_text, cue["took_s"],
+        )
+        # Share it: the server hands it to every player with the playlist.
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    f"{self.api_url}/api/v1/devices/track-cues",
+                    headers={"X-Device-Token": self.device_token},
+                    json={
+                        "source_id": source_id,
+                        "duration_s": cue["duration_s"],
+                        "start_s": cue["start_s"],
+                        "end_s": cue["end_s"],
+                        "version": track_cues.VERSION,
+                    },
+                )
+                if response.status_code >= 400:
+                    logger.info("Server did not take silence cues for %s: %s", source_id, response.status_code)
+        except httpx.HTTPError as exc:
+            logger.info("Could not report silence cues for %s: %s", source_id, exc)
 
     async def ensure_next_prefetched(self) -> None:
         """Call periodically near end-of-track to make sure next URL is ready."""
