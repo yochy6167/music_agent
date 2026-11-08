@@ -136,8 +136,12 @@ async def _decode(vlc: str, url: str, dst: Path, start: float, stop: Optional[fl
             cmd += ["nice", "-n", "19"]
         if shutil.which("ionice"):
             cmd += ["ionice", "-c3"]
+    cmd += [vlc, "-I", "dummy"]
+    if os.name == "nt":
+        cmd.append("--dummy-quiet")  # Windows only: Linux VLC rejects it and exits at once
     cmd += [
-        vlc, "-I", "dummy", "--dummy-quiet", "--no-video", "--no-sub-autodetect-file", "--no-stats",
+        # Audio only: some formats carry video, and transcoding it fails the mux.
+        "--no-video", "--no-sout-video", "--no-sout-spu", "--no-sub-autodetect-file", "--no-stats",
         "--http-reconnect", f"--start-time={start:.2f}",
     ]
     if stop is not None:
