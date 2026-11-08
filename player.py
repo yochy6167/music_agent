@@ -1342,6 +1342,11 @@ class MusicPlayer:
         # Resolve the *next* track in the background so song transitions are near-instant.
         self._schedule_prefetch_next()
         self._schedule_preload()
+        # A song that started cold without a cue (the first after a start, a fallback
+        # during a bot-check) is measured now: it plays trimmed from next time on, on
+        # every player (measured: an unmeasured song left a 4.7s hole at its end).
+        if media_url:
+            self._schedule_cue_analysis(track, media_url)
 
     def _cue_for(self, track: Optional[Dict[str, Any]]) -> Optional[tuple]:
         """(start_s, end_s or None) where the song's music is, when it was measured."""

@@ -43,8 +43,9 @@ from urllib.parse import parse_qs, urlparse
 logger = logging.getLogger(__name__)
 
 # 2: edges relative to the song's own loudness (inaudible fade-outs are cut too).
+# 3: that loudness is the louder of the start and the end (soft outros).
 # A newer version replaces older cues, locally and on the server.
-VERSION = 2
+VERSION = 3
 HEAD_S = 20.0
 TAIL_S = 30.0
 RATE = 8000
@@ -114,18 +115,22 @@ def body_level(levels: list) -> Optional[float]:
     return sound[int(len(sound) * 0.8)]
 
 
-def edge_threshold(levels: list) -> float:
+def edge_threshold(*sections: list) -> float:
     """Below this a song's edge counts as silence: RELATIVE_DB under the song's own body,
     never lower than THRESHOLD_DB. A store hears a fade 30 dB under the music as
     silence (measured at the speaker on the VM: a 3.5s fade-out left a 2.5s "hole"
-    with the absolute threshold alone)."""
-    body = body_level(levels)
-    return THRESHOLD_DB if body is None else max(THRESHOLD_DB, body - RELATIVE_DB)
+    with the absolute threshold alone).
+
+    The body is the louder of the given sections: a song that ends on a soft outro
+    is still measured against the song, or its fade after the outro stays (measured:
+    a 1.5s fade under a quiet ending left a 3s hole)."""
+    bodies = [b for b in (body_level(s) for s in sections) if b is not None]
+    return THRESHOLD_DB if not bodies else max(THRESHOLD_DB, max(bodies) - RELATIVE_DB)
 
 
 def find_cue(head: list, tail: list, duration_s: float) -> Optional[Dict[str, Any]]:
     """{start_s, end_s, lead_s, tail_s} from window levels, or None when unclear."""
-    head_thr, tail_thr = edge_threshold(head), edge_threshold(tail)
+    head_thr = tail_thr = edge_threshold(head, tail)
     loud_head = next((i for i, v in enumerate(head) if v > head_thr), None)
     loud_tail = next((i for i in range(len(tail) - 1, -1, -1) if tail[i] > tail_thr), None)
     if loud_head is None or loud_tail is None or duration_s <= HEAD_S + TAIL_S:
@@ -193,6 +198,7 @@ async def analyze(url: str, duration_hint: Optional[float]) -> Optional[Dict[str
     vlc = vlc_binary()
     duration = duration_from_url(url) or (float(duration_hint) if duration_hint else None)
     if not vlc or not duration:
+        logger.info("Silence analysis skipped: %s", "no VLC binary" if not vlc else "unknown length")
         return None
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="soundops-cue-") as tmp:
@@ -205,13 +211,17 @@ async def analyze(url: str, duration_hint: Optional[float]) -> Optional[Dict[str
             logger.warning("Silence analysis timed out")
             return None
         if not (ok_head and ok_tail):
+            logger.info("Silence analysis: VLC could not decode the %s of the stream", "start" if not ok_head else "end")
             return None
         # Plain Python over ~400k samples: a fraction of a second, off the event loop.
         head, tail = await asyncio.to_thread(
             lambda: (window_levels(_pcm_from_wav(head_wav)), window_levels(_pcm_from_wav(tail_wav)))
         )
     cue = find_cue(head, tail, duration)
-    if cue is not None:
+    if cue is None:
+        logger.info("Silence analysis: no clear sound in the %s (or a song under %.0fs)",
+                    "start" if not any(v > THRESHOLD_DB for v in head) else "end", HEAD_S + TAIL_S)
+    else:
         cue["duration_s"] = round(duration, 2)
         cue["took_s"] = round(time.monotonic() - started, 2)
     return cue
