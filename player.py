@@ -67,6 +67,9 @@ class MusicPlayer:
     PREFETCH_MAX_WAIT_S = 150.0
     # Open the next song in the standby player this long before the current one ends.
     PRELOAD_LEAD_S = 25.0
+    # How long a volume set through libvlc takes to reach the speaker (ALSA via the
+    # PulseAudio/PipeWire plug-in). Measured on the test VM: 1.8s.
+    TAIL_FADE_LATENCY_S = float(os.environ.get("TAIL_FADE_LATENCY_S", "1.8"))
     # Silence held after a seek while VLC refetches and refills its buffer.
     SEEK_REBUFFER_S = 1.2
     # Extra silence after un-pausing, covering the audio output restart.
@@ -1416,6 +1419,13 @@ class MusicPlayer:
         """Fade the current song out into its cut end, if its media has one."""
         if self._tail_fade_task and not self._tail_fade_task.done():
             self._tail_fade_task.cancel()
+        # Off unless TAIL_FADE=1: any libvlc volume change at a song's end broke the
+        # next song's start in 3 of 9 test switches on the VM (dropouts), 0 of 9 without.
+        if os.environ.get("TAIL_FADE", "0").strip().lower() not in ("1", "true", "yes"):
+            return
+        # The fade is timed for VLC's buffer through the PulseAudio/PipeWire plug-in.
+        if os.environ.get("ALSA_AUDIO_DEVICE", "default").strip() not in ("", "default"):
+            return
         track = self.current_track
         applied = self._applied_stop.get(self._cache_key(track)) if track else None
         if not applied or applied[1] < 0.2:
@@ -1428,13 +1438,19 @@ class MusicPlayer:
             return
 
     async def _fade_out_tail(self, track_id: Any, end_s: float, fade_s: float) -> None:
-        """Lower this song's own player to silence over the last fade_s before its stop-time.
+        """Fade this song out over the last fade_s before its stop-time.
 
-        The next song plays on the other player at the intended volume, so nothing
-        needs restoring after a switch. Paused, seeked, an ad, or no switch within
-        3s of the end: the volume goes back.
+        libvlc applies a volume to the audio it is preparing, which reaches the
+        speaker TAIL_FADE_LATENCY_S later (measured on the VM: 1.8s, VLC's ALSA
+        buffer through the PulseAudio/PipeWire plug-in). So the fade runs that much
+        ahead of the position, and the level goes back once every sample up to the
+        cut is prepared. Left down, the player's next song started silent for those
+        1.8s (measured: a 2.7s gap at every switch). Only on the "default" ALSA
+        device: a direct hardware device has a shorter buffer, and the restore
+        would replay the last notes loud. Paused, seeked or an ad: restored at once.
         """
         end_ms, fade_ms = end_s * 1000.0, fade_s * 1000.0
+        lat_ms = self.TAIL_FADE_LATENCY_S * 1000.0
         player = None
         start_vol = None
         try:
@@ -1448,19 +1464,22 @@ class MusicPlayer:
                     pos = -1
                 if pos >= 0 and self._expect_playing and not self._ad_playing:
                     remaining = end_ms - pos
-                    if remaining <= fade_ms:
+                    if remaining <= fade_ms + lat_ms:
                         break
-                    await asyncio.sleep(min(1.0, max(0.05, (remaining - fade_ms) / 1000.0 - 0.05)))
+                    await asyncio.sleep(min(1.0, max(0.05, (remaining - fade_ms - lat_ms) / 1000.0 - 0.05)))
                 else:
                     await asyncio.sleep(0.5)
             start_vol = player.audio_get_volume()
             if not start_vol or start_vol <= 0:
                 return
             pos_ref, t_ref = float(player.get_time()), time.monotonic()
-            logger.info("Fading out track %s over %.1fs into its cut end", track_id, (end_ms - pos_ref) / 1000.0)
+            logger.info(
+                "Fading out track %s over %.1fs into its cut end (%.1fs ahead for the output latency)",
+                track_id, fade_s, self.TAIL_FADE_LATENCY_S,
+            )
             while True:
                 if self.current_track_id != track_id or player is not self.player:
-                    return  # switched: the new song has its own volume
+                    return  # switched already
                 if self._ad_playing or not self._expect_playing:
                     break  # an ad takes over the volume / paused: restore below
                 pos = pos_ref + (time.monotonic() - t_ref) * 1000.0
@@ -1470,10 +1489,14 @@ class MusicPlayer:
                     real = pos
                 if real >= 0 and abs(real - pos) > 1500:
                     break  # a seek
-                remaining = end_ms - pos
-                if remaining <= -3000:
-                    break  # stop-time never ended it: don't leave the song silent
-                frac = max(0.0, min(1.0, remaining / fade_ms))
+                # How far the audio being prepared right now is from the cut. Once it is
+                # all prepared the level goes back (below), while this output still runs:
+                # put back at the switch instead, the next song on this player played
+                # broken in 2 of 6 switches on the VM.
+                prepared_left = end_ms - pos - lat_ms
+                if prepared_left <= 0:
+                    break
+                frac = max(0.0, min(1.0, prepared_left / fade_ms))
                 # An S-curve: starts gently, ends at silence.
                 gain = 0.5 - 0.5 * math.cos(math.pi * frac)
                 player.audio_set_volume(max(0, min(100, int(round(start_vol * gain)))))
@@ -1608,6 +1631,16 @@ class MusicPlayer:
         self._seeked_at = 0.0
 
         switch_at = time.monotonic()
+        # The old player plays the song after next: it must not keep a faded level
+        # (it would start that song silent). The fade puts it back itself; this is the
+        # safety net for a fade cut short, so only when it really is still down.
+        if not self._ad_playing:
+            try:
+                target_vol = max(0, min(100, int(self.volume)))
+                if old.audio_get_volume() != target_vol:
+                    old.audio_set_volume(target_vol)
+            except Exception:
+                pass
         # The old song first: its output must be gone before the new one opens.
         try:
             old.stop()
