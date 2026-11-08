@@ -1347,12 +1347,25 @@ class MusicPlayer:
         """(start_s, end_s or None) where the song's music is, when it was measured."""
         if not self._silence_trim or not track or track.get("source") != "youtube":
             return None
+        server = None
         if track.get("play_start_s") is not None:
-            return float(track["play_start_s"]), track.get("play_end_s")
+            server = (float(track["play_start_s"]), track.get("play_end_s"))
+            if self._server_cue_current(track):
+                return server
         local = self.cues.get(track.get("source_id"))
         if local:
             return float(local.get("s") or 0.0), local.get("e")
-        return None
+        # An older analyzer's cue still beats none until the song is measured again.
+        return server
+
+    @staticmethod
+    def _server_cue_current(track: Dict[str, Any]) -> bool:
+        # Servers before play_cue_version only had version-1 cues.
+        return track.get("play_start_s") is not None and int(track.get("play_cue_version") or 1) >= track_cues.VERSION
+
+    def _cue_current(self, track: Dict[str, Any]) -> bool:
+        """Measured by this analyzer version (here or by another player): no new analysis needed."""
+        return self._server_cue_current(track) or self.cues.get(track.get("source_id")) is not None
 
     def _effective_length_ms(self, length_ms: int) -> int:
         """Where the current song ends when its silent tail is cut (:stop-time)."""
@@ -1839,7 +1852,7 @@ class MusicPlayer:
         """Measure the next song's silent edges while this one plays (once per song)."""
         if not self._silence_trim or track.get("source") != "youtube" or not track.get("source_id"):
             return
-        if self._cue_for(track) is not None:
+        if self._cue_current(track):
             return
         if self._cue_task and not self._cue_task.done():
             return  # one at a time; the next prefetch tries again
