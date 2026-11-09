@@ -45,8 +45,10 @@ logger = logging.getLogger(__name__)
 # 2: edges relative to the song's own loudness (inaudible fade-outs are cut too).
 # 3: that loudness is the louder of the start and the end (soft outros).
 # 4: the end is cut 25 dB under the song, with a fade-out (fade_s) instead of a hard stop.
+# 5: back to 30 dB at the end (the player's fade is off: no abrupt stop), the WAV
+#    header's rate is used, and a tail cut short by the network is not measured.
 # A newer version replaces older cues, locally and on the server.
-VERSION = 4
+VERSION = 5
 HEAD_S = 20.0
 TAIL_S = 30.0
 RATE = 8000
@@ -55,7 +57,9 @@ THRESHOLD_DB = -55.0  # absolute floor: always silence below this
 RELATIVE_DB = 30.0  # ...and so is anything this far under the song's body (the start)
 # The end is cut closer to the music: the player fades out into the cut (fade_s),
 # so a slow fade-out ends sooner without stopping abruptly.
-RELATIVE_DB_END = 25.0
+# 30 like the start while the player's fade is off (TAIL_FADE): a hard stop 25 dB
+# under the song can be heard on a slow fade-out; at 30 dB it can't.
+RELATIVE_DB_END = 30.0
 FULL_DB = 10.0  # within this of the body the song still plays at full level
 MAX_FADE_S = 2.0
 MIN_LEAD_S = 0.4  # shorter silences are not worth a cut
@@ -88,18 +92,44 @@ def duration_from_url(url: str) -> Optional[float]:
         return None
 
 
-def _pcm_from_wav(path: Path) -> array.array:
-    """16-bit samples after the "data" chunk header (VLC may leave its size unset)."""
+def _pcm_from_wav(path: Path) -> Optional[tuple]:
+    """(mono 16-bit samples, sample rate) from a WAV, or None when it is not 16-bit PCM.
+
+    The rate comes from the header, not from what was asked of VLC: measured at a
+    wrong rate every time is off by that factor (8 kHz assumed, 48 kHz delivered:
+    1.4s of silence would read as 8.4s). The data size may be unset (VLC killed),
+    so the samples run to the end of the file.
+    """
     raw = path.read_bytes()
-    at = raw.find(b"data")
-    samples = array.array("h")
-    if at < 0:
-        return samples
+    if len(raw) < 44 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        return None
+    fmt = None
+    at = 12
+    while at + 8 <= len(raw):
+        cid, size = raw[at:at + 4], int.from_bytes(raw[at + 4:at + 8], "little")
+        if cid == b"fmt ":
+            fmt = raw[at + 8:at + 8 + 16]
+        elif cid == b"data":
+            break
+        at += 8 + size + (size & 1)
+    else:
+        return None
+    if fmt is None or len(fmt) < 16:
+        return None
+    audio_format = int.from_bytes(fmt[0:2], "little")
+    channels = int.from_bytes(fmt[2:4], "little")
+    rate = int.from_bytes(fmt[4:8], "little")
+    bits = int.from_bytes(fmt[14:16], "little")
+    if audio_format not in (1, 0xFFFE) or bits != 16 or not channels or not (1000 <= rate <= 192000):
+        return None
     body = raw[at + 8:]
+    samples = array.array("h")
     samples.frombytes(body[: len(body) - len(body) % 2])
     if sys.byteorder == "big":
         samples.byteswap()
-    return samples
+    if channels > 1:
+        samples = samples[::channels]  # the first channel is enough for a level
+    return samples, rate
 
 
 def window_levels(samples: array.array, rate: int = RATE, window_s: float = WINDOW_S) -> list:
@@ -248,9 +278,19 @@ async def analyze(url: str, duration_hint: Optional[float]) -> Optional[Dict[str
             logger.info("Silence analysis: VLC could not decode the %s of the stream", "start" if not ok_head else "end")
             return None
         # Plain Python over ~400k samples: a fraction of a second, off the event loop.
-        head, tail = await asyncio.to_thread(
-            lambda: (window_levels(_pcm_from_wav(head_wav)), window_levels(_pcm_from_wav(tail_wav)))
-        )
+        pcm_head, pcm_tail = await asyncio.to_thread(lambda: (_pcm_from_wav(head_wav), _pcm_from_wav(tail_wav)))
+        if pcm_head is None or pcm_tail is None:
+            logger.info("Silence analysis: VLC did not write 16-bit PCM")
+            return None
+        # The end is measured from the end of the decoded tail, so it must really reach
+        # the end of the song: a read cut short by the network ends somewhere in the
+        # middle and would put the cut there. (A seek lands early, so it is never short.)
+        tail_seconds = len(pcm_tail[0]) / pcm_tail[1]
+        if tail_seconds < min(TAIL_S, duration) - 1.0:
+            logger.info("Silence analysis: only %.1fs of the end decoded (stream cut short?)", tail_seconds)
+            return None
+        head = await asyncio.to_thread(window_levels, pcm_head[0], pcm_head[1])
+        tail = await asyncio.to_thread(window_levels, pcm_tail[0], pcm_tail[1])
     cue = find_cue(head, tail, duration)
     if cue is None:
         logger.info("Silence analysis: no clear sound in the %s (or a song under %.0fs)",
@@ -283,6 +323,14 @@ class CueStore:
             for key, _ in sorted(self._data.items(), key=lambda kv: kv[1].get("t", 0))[: len(self._data) - _STORE_LIMIT]:
                 self._data.pop(key, None)
         self._save()
+
+    def mark_bad(self, source_id: str, duration_s: Optional[float]) -> None:
+        """This video's cue kept it from starting: play it untrimmed, even after a restart."""
+        self._data[source_id] = {"s": 0.0, "e": None, "f": 0.0, "d": duration_s, "v": VERSION, "t": int(time.time()), "bad": True}
+        self._save()
+
+    def is_bad(self, source_id: Optional[str]) -> bool:
+        return bool((self._data.get(source_id or "") or {}).get("bad"))
 
     def _save(self) -> None:
         try:

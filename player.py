@@ -167,6 +167,10 @@ class MusicPlayer:
         # (end_s, fade_s) actually put on each track's media (by cache key): a song
         # fades out only when its media really stops at end_s.
         self._applied_stop: Dict[str, tuple] = {}
+        # Tracks whose media got any cue (start-time / stop-time), and videos whose
+        # cue kept them from opening: those play untrimmed from now on.
+        self._cued_media: set = set()
+        self._bad_cues: set = set()
         self._tail_fade_task: Optional[asyncio.Task] = None
         # {"key": cache key of the waiting track, "player": the standby player}
         self._preloaded: Optional[dict] = None
@@ -1153,6 +1157,7 @@ class MusicPlayer:
         _fresh_retry: bool = False,
         _youtube_hold: bool = False,
         media_url_override: Optional[str] = None,
+        _no_cue: bool = False,
     ) -> None:
         if not self.current_playlist or not self.player:
             return
@@ -1235,7 +1240,10 @@ class MusicPlayer:
             await self._play_current_track_locked(_skip_depth=_skip_depth + 1)
             return
 
-        media = self._new_music_media(media_url, track=track)
+        if _no_cue:
+            self._applied_stop.pop(self._cache_key(track), None)
+            self._cued_media.discard(self._cache_key(track))
+        media = self._new_music_media(media_url, track=None if _no_cue else track)
 
         # Mute while VLC fills the network buffer, so a rough start is inaudible.
         self._warming_up = True
@@ -1320,6 +1328,14 @@ class MusicPlayer:
                     _skip_depth=_skip_depth, _fresh_retry=True
                 )
                 return
+            if not _no_cue and self._cache_key(track) in self._cued_media:
+                # A cue that breaks the start (a seek the stream refuses, a bad value)
+                # would skip the song on every player: try the same URL once without it.
+                logger.warning("Track %s would not start with its silence cues — trying once without them", track.get("id"))
+                await self._play_current_track_locked(
+                    _skip_depth=_skip_depth, _fresh_retry=True, media_url_override=media_url, _no_cue=True
+                )
+                return
             try:
                 vlc_state = self.player.get_state() if self.player else None
             except Exception:
@@ -1336,6 +1352,8 @@ class MusicPlayer:
 
         self._play_started_at = time.monotonic()
         self._progress_changed_at = time.monotonic()
+        if _no_cue and track.get("source_id"):
+            self._drop_bad_cue(track)
         if track.get("source") == "youtube" and media_url:
             self._youtube_hold_url = media_url
             self._youtube_hold_track_id = track.get("id")
@@ -1360,16 +1378,50 @@ class MusicPlayer:
         """(start_s, end_s or None, fade_s) where the song's music is, when it was measured."""
         if not self._silence_trim or not track or track.get("source") != "youtube":
             return None
+        if track.get("source_id") in self._bad_cues or self.cues.is_bad(track.get("source_id")):
+            return None
         server = None
         if track.get("play_start_s") is not None:
-            server = (float(track["play_start_s"]), track.get("play_end_s"), float(track.get("play_fade_s") or 0.0))
-            if self._server_cue_current(track):
+            server = self._sane_cue(track, track.get("play_start_s"), track.get("play_end_s"), track.get("play_fade_s"))
+            if server and self._server_cue_current(track):
                 return server
         local = self.cues.get(track.get("source_id"))
         if local:
-            return float(local.get("s") or 0.0), local.get("e"), float(local.get("f") or 0.0)
+            sane = self._sane_cue(track, local.get("s"), local.get("e"), local.get("f"))
+            if sane:
+                return sane
         # An older analyzer's cue still beats none until the song is measured again.
         return server
+
+    # The most a cue may cut. Measured cuts so far: up to 3s at the start, 7.9s at the
+    # end; the analyzer looks at 20s / 30s. Anything beyond is more likely a bad value
+    # (from the server or a store) than silence, so the song plays untrimmed.
+    MAX_CUE_LEAD_S = 12.0
+    MAX_CUE_TAIL_S = 15.0
+
+    def _sane_cue(self, track: Dict[str, Any], start: Any, end: Any, fade: Any) -> Optional[tuple]:
+        """(start_s, end_s, fade_s) when the values make sense for this song, else None."""
+        try:
+            start_s = float(start or 0.0)
+            end_s = None if end in (None, "") else float(end)
+            fade_s = float(fade or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(v) for v in (start_s, fade_s) + (() if end_s is None else (end_s,))):
+            return None
+        if not (0.0 <= start_s <= self.MAX_CUE_LEAD_S) or not (0.0 <= fade_s <= 5.0):
+            return None
+        if end_s is not None:
+            if end_s - start_s < 30.0:
+                return None
+            try:
+                duration = float(track.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                duration = 0.0
+            # YouTube rounds durations to whole seconds; a cue may be up to 1s past it.
+            if duration > 0 and not (duration - self.MAX_CUE_TAIL_S - 1.0 <= end_s <= duration + 1.5):
+                return None
+        return start_s, end_s, fade_s
 
     @staticmethod
     def _server_cue_current(track: Dict[str, Any]) -> bool:
@@ -1382,9 +1434,10 @@ class MusicPlayer:
 
     def _effective_length_ms(self, length_ms: int) -> int:
         """Where the current song ends when its silent tail is cut (:stop-time)."""
-        cue = self._cue_for(self.current_track)
-        if cue and cue[1] and length_ms and length_ms > 0:
-            return min(length_ms, int(float(cue[1]) * 1000))
+        track = self.current_track
+        applied = self._applied_stop.get(self._cache_key(track)) if track else None
+        if applied and length_ms and length_ms > 0:
+            return min(length_ms, int(applied[0] * 1000))
         return length_ms
 
     def _new_music_media(self, url: str, *, start_paused: bool = False, track: Optional[Dict[str, Any]] = None) -> Any:
@@ -1398,6 +1451,9 @@ class MusicPlayer:
         key = self._cache_key(track) if track else None
         if key:
             self._applied_stop.pop(key, None)
+            self._cued_media.discard(key)
+        if cue and key:
+            self._cued_media.add(key)
         if cue:
             # Skip the silent edges. stop-time ends the song (EndReached) there,
             # so the switch to the next song happens where the music stops.
@@ -1509,6 +1565,12 @@ class MusicPlayer:
             raise
         except Exception as exc:
             logger.debug("Tail fade stopped: %s", exc)
+            # Never leave the song (or this player's next one) down after an error.
+            try:
+                if player is not None and player is self.player and start_vol and not self._ad_playing:
+                    self._apply_intended_volume()
+            except Exception:
+                pass
 
     def _schedule_preload(self) -> None:
         self._schedule_tail_fade()
@@ -1972,6 +2034,32 @@ class MusicPlayer:
         except Exception as exc:
             logger.warning("Prefetch failed: %s", exc)
 
+    def _drop_bad_cue(self, track: Dict[str, Any]) -> None:
+        """The song played only without its cue: play it untrimmed, here and everywhere."""
+        source_id = track["source_id"]
+        self._bad_cues.add(source_id)
+        track["play_start_s"], track["play_end_s"], track["play_fade_s"] = 0.0, None, 0.0
+        duration = track.get("duration")
+        self.cues.mark_bad(source_id, float(duration) if duration else None)
+        logger.warning("Silence cues for track %s kept it from starting: dropped (it plays untrimmed)", track.get("id"))
+        if duration:
+            # The server keeps a cue per video for every player: replace it with "nothing to cut".
+            asyncio.get_running_loop().create_task(self._report_cue(source_id, float(duration), 0.0, None, 0.0))
+
+    async def _report_cue(self, source_id: str, duration_s: float, start_s: float, end_s: Optional[float], fade_s: float) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    f"{self.api_url}/api/v1/devices/track-cues",
+                    headers={"X-Device-Token": self.device_token},
+                    json={"source_id": source_id, "duration_s": duration_s, "start_s": start_s, "end_s": end_s,
+                          "fade_s": fade_s, "version": track_cues.VERSION},
+                )
+                if response.status_code >= 400:
+                    logger.info("Server did not take silence cues for %s: %s", source_id, response.status_code)
+        except httpx.HTTPError as exc:
+            logger.info("Could not report silence cues for %s: %s", source_id, exc)
+
     def _schedule_cue_analysis(self, track: Dict[str, Any], url: str) -> None:
         """Measure the next song's silent edges while this one plays (once per song)."""
         if not self._silence_trim or track.get("source") != "youtube" or not track.get("source_id"):
@@ -2004,24 +2092,7 @@ class MusicPlayer:
             track.get("id"), cue["lead_s"], cue["tail_s"], cue["start_s"], end_text, cue["took_s"], cue.get("fade_s") or 0.0,
         )
         # Share it: the server hands it to every player with the playlist.
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
-                    f"{self.api_url}/api/v1/devices/track-cues",
-                    headers={"X-Device-Token": self.device_token},
-                    json={
-                        "source_id": source_id,
-                        "duration_s": cue["duration_s"],
-                        "start_s": cue["start_s"],
-                        "end_s": cue["end_s"],
-                        "fade_s": cue.get("fade_s") or 0.0,
-                        "version": track_cues.VERSION,
-                    },
-                )
-                if response.status_code >= 400:
-                    logger.info("Server did not take silence cues for %s: %s", source_id, response.status_code)
-        except httpx.HTTPError as exc:
-            logger.info("Could not report silence cues for %s: %s", source_id, exc)
+        await self._report_cue(source_id, cue["duration_s"], cue["start_s"], cue["end_s"], cue.get("fade_s") or 0.0)
 
     async def ensure_next_prefetched(self) -> None:
         """Call periodically near end-of-track to make sure next URL is ready."""
