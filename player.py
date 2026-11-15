@@ -146,6 +146,8 @@ class MusicPlayer:
         self._seeked_at: float = 0.0
         self._frozen_track_id: Optional[Any] = None
         self._frozen_restarts: int = 0
+        # Where it froze: progress counts only past this point
+        self._frozen_at_ms: int = 0
         self._last_reload_at: float = 0.0
         self._resolve_failures_since_reload: int = 0
         self._youtube_blocked_until: float = 0.0
@@ -2213,9 +2215,11 @@ class MusicPlayer:
         if pos_ms < 0 or abs(pos_ms - self._progress_position_ms) > 250:
             self._progress_position_ms = pos_ms
             self._progress_changed_at = now
-            # Healthy playback clears the give-up counter so an isolated freeze later
-            # in the same track still gets its full quota of retries.
-            if self._frozen_track_id is not None and pos_ms > 0:
+            # Playback well past the freeze point clears the give-up counter, so a
+            # later, separate freeze still gets its retries. Any progress used to
+            # clear it: a restart plays from the start, so a stream that always
+            # dies at the same second restarted forever and was never skipped.
+            if self._frozen_track_id is not None and pos_ms > self._frozen_at_ms + 5000:
                 self._frozen_track_id = None
                 self._frozen_restarts = 0
             return False
@@ -2233,6 +2237,7 @@ class MusicPlayer:
             self._frozen_track_id = self.current_track_id
             self._frozen_restarts = 0
         self._frozen_restarts += 1
+        self._frozen_at_ms = max(pos_ms, 0)
 
         # Retrying the same track forever would leave the branch silent, so give up
         # on it after a couple of attempts and move on to the next one.
