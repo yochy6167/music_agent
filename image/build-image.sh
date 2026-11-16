@@ -159,7 +159,7 @@ ls "$ROOT"/etc/ssh/ssh_host_* >/dev/null 2>&1 && { echo "  FAIL SSH host keys le
 [ -n "$(ls -A "$ROOT/var/lib/tailscale" 2>/dev/null)" ] && { echo "  FAIL tailscale state left"; bad=1; }
 ls "$ROOT"/etc/NetworkManager/system-connections/* >/dev/null 2>&1 && { echo "  FAIL saved networks left"; bad=1; }
 # A real Tailscale key looks like tskey-auth-kXXXX-XXXXXXXXXXXXXXXX (the regex in tailscale_ops.py does not)
-grep -rIl --exclude-dir=.venv -E 'tskey-[a-z]+-[A-Za-z0-9]{4,}-[A-Za-z0-9]{12,}|"device_token": *"[^"]' "$ROOT/home/pi" "$ROOT/etc" "$ROOT/boot/firmware" 2>/dev/null \
+grep -rIl --exclude-dir=.venv --exclude=build-image.sh -E 'tskey-[a-z]+-[A-Za-z0-9]{4,}-[A-Za-z0-9]{12,}|"device_token": *"[^"]' "$ROOT/home/pi" "$ROOT/etc" "$ROOT/boot/firmware" 2>/dev/null \
   && { echo "  FAIL a key or token in the files above"; bad=1; }
 [ "$bad" = 0 ] || exit 1
 echo "  PASS"

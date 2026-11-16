@@ -100,6 +100,8 @@ class OutputManager:
         self.connected_since: Optional[float] = None
         self.adapter_powered: Optional[bool] = None
         self.last_error: Optional[str] = None
+        # BlueZ's Bonded (None: unknown / older BlueZ). False: works now, lost on reboot
+        self.bonded: Optional[bool] = None
         self.default_sink: Optional[str] = None
         self.sink_volume: Optional[int] = None
         self.sink_muted: Optional[bool] = None
@@ -197,6 +199,12 @@ class OutputManager:
             self._failures += 1
             return
         info = await self.info(mac)
+        bonded = info.get("bonded")
+        if bonded is False and self.bonded is not False:
+            logger.warning("Speaker %s is paired without a stored key: it may not come back after a reboot. "
+                           "Pair it again from the dashboard.", mac)
+        if bonded is not None:
+            self.bonded = bonded
         if info.get("connected"):
             if not self.connected:
                 self.connected_since = time.time()
@@ -339,7 +347,7 @@ class OutputManager:
             value = value.strip()
             if key == "Name":
                 info["name"] = value
-            elif key in ("Paired", "Trusted", "Connected"):
+            elif key in ("Paired", "Bonded", "Trusted", "Connected"):
                 info[key.lower()] = value == "yes"
             elif key == "RSSI":
                 match = re.search(r"-?\d+", value)
@@ -417,7 +425,20 @@ class OutputManager:
             if not info.get("name") and "rssi" not in info:
                 raise BtError("bt_not_found", "הרמקול לא נמצא בסריקה: להכניס למצב צימוד ולסרוק שוב.")
             await progress("pairing", "מצמד")
-            await self._bt_step(["pair", mac], 30, "Pairing successful", tolerate=("AlreadyExists",))
+            # A clean Pi OS starts the adapter non-pairable, and BlueZ then pairs
+            # without bonding: it works at once, but no key is stored, so after a
+            # reboot the speaker refuses the Pi ("Connection refused"). Pairable
+            # only for this step: nobody else can pair with the Pi meanwhile.
+            await self.btctl(["pairable", "on"], timeout=6)
+            try:
+                await self._bt_step(["pair", mac], 30, "Pairing successful", tolerate=("AlreadyExists",))
+            finally:
+                await self.btctl(["pairable", "off"], timeout=6)
+            bonded = (await self.info(mac)).get("bonded")
+            if bonded is False:
+                raise BtError("bt_not_saved",
+                              "הצימוד לא נשמר במכשיר, ולכן לא יחזיק אחרי הפעלה מחדש. "
+                              "להכניס את הרמקול שוב למצב צימוד ולנסות שוב.")
             await progress("trusting", "מסמן כמכשיר מהימן")
             await self._bt_step(["trust", mac], 8, "trust succeeded")
             await progress("connecting", "מתחבר")
@@ -437,6 +458,7 @@ class OutputManager:
             self.state.setdefault("sink_volume", DEFAULT_SINK_VOLUME)
             self._save()
             self.connected, self.connected_since, self.last_error, self._failures = True, time.time(), None, 0
+            self.bonded = bonded
             self._volume_set_on = None
             current = await self.apply_output()
         await self._disable_legacy_service()
@@ -510,6 +532,7 @@ class OutputManager:
                 "connected": self.connected,
                 "connected_since": int(self.connected_since) if self.connected_since else None,
                 "last_error": self.last_error,
+                "bonded": self.bonded,
             },
             "audio": {
                 "mode": self.mode,

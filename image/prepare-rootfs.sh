@@ -97,6 +97,11 @@ systemctl disable bt-keep.service 2>/dev/null || true
 
 log "boot config: HDMI audio without a monitor, Wi-Fi country IL"
 grep -qE '^hdmi_force_hotplug=1' /boot/firmware/config.txt || echo "hdmi_force_hotplug=1" >>/boot/firmware/config.txt
+# A 3-wire case fan (the official Pi 4 one: control on GPIO14, pin 8) otherwise
+# runs nonstop, since that pin idles high. On from 65°C, off 10°C lower.
+# A 2-wire fan (5V/GND) and the Pi 5 cooler ignore this.
+grep -qE '^dtoverlay=gpio-fan' /boot/firmware/config.txt || \
+  printf '\n# SoundOps: case fan by temperature\ndtoverlay=gpio-fan,gpiopin=14,temp=65000\n' >>/boot/firmware/config.txt
 grep -q 'cfg80211.ieee80211_regdom=' /boot/firmware/cmdline.txt || \
   sed -i '1 s/$/ cfg80211.ieee80211_regdom=IL/' /boot/firmware/cmdline.txt
 
@@ -113,6 +118,7 @@ check "ALSA default->PipeWire" "ls /usr/share/alsa/alsa.conf.d/99-pipewire-defau
 check "libspa bluetooth"      "dpkg -s libspa-0.2-bluetooth"
 check "wireplumber seat fix"  "grep -q seat-monitoring /home/pi/.config/wireplumber/wireplumber.conf.d/50-bluez.conf"
 check "linger"                "[ -e /var/lib/systemd/linger/pi ]"
+check "case fan overlay"      "grep -q '^dtoverlay=gpio-fan,gpiopin=14' /boot/firmware/config.txt"
 check "music_agent enabled"   "systemctl is-enabled music_agent.service"
 check "firstboot enabled"     "systemctl is-enabled soundops-firstboot.service"
 check "userconfig disabled"   "! systemctl is-enabled userconfig.service"
