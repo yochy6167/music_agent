@@ -1,5 +1,5 @@
 {
-  "api_url": "https://sev.neeman-music.online",
-  "ws_url": "wss://ws.neeman-music.online",
+  "api_url": "https://srv.soundopsmusic.com",
+  "ws_url": "wss://ws.soundopsmusic.com",
   "devices": []
 }

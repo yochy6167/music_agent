@@ -203,8 +203,8 @@ amixer -c 0 sget 'PCM'
 
 ```json
 {
-  "api_url": "https://sev.neeman-music.online",
-  "ws_url": "wss://ws.neeman-music.online"
+  "api_url": "https://srv.soundopsmusic.com",
+  "ws_url": "wss://ws.soundopsmusic.com"
 }
 ```
 
@@ -362,7 +362,7 @@ pactl set-default-sink bluez_sink.1C_57_DC_21_DA_48.a2dp_sink
 | בעיה | פתרון |
 |------|--------|
 | SSH לא מתחבר | ודא SSH מופעל ב-Imager; נסה IP מ-הראוטר |
-| `pending` לא נגמר | שייך מכשיר בפאנל; בדוק `api_url` נגיש מה-Pi: `curl -I https://sev.neeman-music.online` |
+| `pending` לא נגמר | שייך מכשיר בפאנל; בדוק `api_url` נגיש מה-Pi: `curl -I https://srv.soundopsmusic.com` |
 | השירות נופל | `journalctl -u music_agent -n 50` |
 | אין סידורי Pi בלוג | `cat /proc/cpuinfo \| grep Serial` — אם `00000000`, עדכן EEPROM/firmware |
 | VLC / נגינה | `sudo apt install vlc libvlc-dev` ואז `bash setup.sh` שוב |
